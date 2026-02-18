@@ -30,7 +30,7 @@ Target: GPT-3 level intelligence + Opus 4.6 writing quality.
 - `training/data_pipeline.py` — StreamingTextDataset
 - `training/build_tokenizer.py` — BPE tokenizer builder (32K vocab)
 - `collect_data.py` — Downloads ~200GB article-focused training data
-- `filter_data.py` — Two-phase filter (quality classifier + article heuristics)
+- `filter_data.py` — 5-judge AI filter (2 rounds, majority vote)
 - `run.sh` — Universal launcher
 
 ## Data Pipeline
@@ -44,14 +44,20 @@ Sources (~200GB total):
 - C4 RealNews — News-style articles
 - C4 English — Diverse well-written web content
 
-Filtering:
-- Phase 1: FineWeb-Edu classifier (pre-trained, scores 0-5, keep >= 3)
-- Phase 2: Article heuristics (paragraph structure, sentence length, readability, no code/lists)
+5-Judge AI Filter (all run simultaneously on GPUs):
+1. FineWeb-Edu classifier — Educational quality (score >= 3.0 / 3.5)
+2. CoLA DistilBERT — Grammatical acceptability
+3. Toxic-BERT — Toxicity detection (reject toxic)
+4. OpenAI GPT detector — AI slop detection (reject AI-generated)
+5. Formality ranker — Writing professionalism (score >= 0.5 / 0.6)
+
+Round 1: Keep docs with >= 3/5 judge votes (broad pass)
+Round 2: Keep docs with >= 4/5 judge votes (only the best)
 
 ## Pipeline Commands
 ```
 bash run.sh collect     # Download ~200GB article data
-bash run.sh filter      # Phase 1 + Phase 2 filtering
+bash run.sh filter      # 5-judge AI filter (2 rounds)
 bash run.sh tokenizer   # Build tokenizer
 bash run.sh train       # Train model (5x B200, ~23 hrs)
 bash run.sh all         # filter + tokenizer + train

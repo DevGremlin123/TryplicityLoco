@@ -1,8 +1,7 @@
 """
-Tryplicity Data Collection — Download ~200GB of article-focused training data.
+Tryplicity Data Collection — Download ~210GB of article-focused training data.
 
-All sources chosen for article-quality prose and factual knowledge.
-No code, no math, no academic papers. Just well-written articles.
+All sources chosen for article-quality prose, factual knowledge, and HTML expertise.
 
 Sources:
   1. FineWeb-Edu (sample-100BT)  — Educational web articles, pre-scored
@@ -11,6 +10,8 @@ Sources:
   4. PG19 Books                   — Long-form prose, writing quality
   5. C4 RealNews                  — News-style articles
   6. C4 English                   — Diverse well-written web content
+  7. The Stack (HTML)             — Real-world HTML from GitHub repos
+  8. WebSight                     — Synthetic HTML pages with proper structure
 
 Run:  python collect_data.py
 """
@@ -90,6 +91,29 @@ DATASETS = [
         "est_gb": 35,
         "desc": "Diverse well-written English web content",
     },
+    {
+        "name": "html_stack",
+        "dataset_id": "bigcode/the-stack-dedup",
+        "subset": None,
+        "data_dir": "data/html",
+        "num_samples": 500_000,
+        "text_key": "content",
+        "min_chars": 200,
+        "est_gb": 8,
+        "is_html": True,
+        "desc": "Real-world HTML from GitHub repos",
+    },
+    {
+        "name": "html_websight",
+        "dataset_id": "HuggingFaceM4/WebSight",
+        "subset": "v0.2",
+        "num_samples": 500_000,
+        "text_key": "text",
+        "min_chars": 200,
+        "est_gb": 3,
+        "is_html": True,
+        "desc": "Synthetic HTML pages with proper structure",
+    },
 ]
 
 
@@ -112,10 +136,13 @@ def save_manifest(manifest):
         MANIFEST_FILE.write_text(json.dumps(manifest, indent=2))
 
 
-def is_quality_text(text, min_chars=300):
+def is_quality_text(text, min_chars=300, is_html=False):
     """Basic pre-filter. Real filtering happens in filter_data.py."""
     if len(text) < min_chars:
         return False
+    if is_html:
+        # For HTML: just check it has actual HTML tags and some content
+        return "<" in text and ">" in text
     # Alphanumeric ratio check
     alnum = sum(c.isalnum() or c.isspace() for c in text[:2000])
     if alnum / min(len(text), 2000) < 0.50:
@@ -170,8 +197,9 @@ def download_dataset(cfg):
         kwargs = {
             "split": "train",
             "streaming": True,
-            "trust_remote_code": True,
         }
+        if cfg.get("data_dir"):
+            kwargs["data_dir"] = cfg["data_dir"]
         if cfg.get("subset"):
             ds = load_dataset(cfg["dataset_id"], cfg["subset"], **kwargs)
         else:
@@ -184,6 +212,7 @@ def download_dataset(cfg):
     min_chars = cfg.get("min_chars", 300)
     min_score = cfg.get("min_score")
     score_key = cfg.get("score_key")
+    is_html = cfg.get("is_html", False)
     target = cfg["num_samples"]
     saved = existing
     skipped_resume = 0
@@ -217,7 +246,7 @@ def download_dataset(cfg):
                 text = text[:100_000]
 
             # Basic quality check
-            if not is_quality_text(text, min_chars):
+            if not is_quality_text(text, min_chars, is_html=is_html):
                 skipped_quality += 1
                 continue
 

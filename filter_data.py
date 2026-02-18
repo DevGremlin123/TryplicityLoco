@@ -262,12 +262,35 @@ def main():
         min_votes = 4
         is_strict = True
 
-    input_files = sorted(input_dir.glob("*.jsonl"))
-    if not input_files:
+    # HTML files bypass judges — copy directly to output
+    HTML_PREFIXES = ("html_stack", "html_websight")
+
+    all_jsonl = sorted(input_dir.glob("*.jsonl"))
+    input_files = [f for f in all_jsonl if not any(f.name.startswith(p) for p in HTML_PREFIXES)]
+    html_files = [f for f in all_jsonl if any(f.name.startswith(p) for p in HTML_PREFIXES)]
+
+    if not all_jsonl:
         print(f"  ERROR: No .jsonl files in {input_dir}")
         if args.round == 2:
             print("  Run round 1 first: python filter_data.py --round 1")
         sys.exit(1)
+
+    # Copy HTML files directly (no judge filtering for code)
+    if html_files:
+        import shutil as _shutil
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        for hf in html_files:
+            dest = Path(output_dir) / hf.name
+            if not dest.exists():
+                _shutil.copy2(str(hf), str(dest))
+                n = sum(1 for _ in open(hf, "r", encoding="utf-8"))
+                print(f"  HTML bypass: {hf.name} ({n:,} docs) → copied directly")
+            else:
+                print(f"  HTML bypass: {hf.name} → already in output")
+
+    if not input_files:
+        print(f"  No non-HTML files to filter. Done.")
+        return
 
     scores_dir.mkdir(parents=True, exist_ok=True)
 
