@@ -1,18 +1,29 @@
 """
-Tryplicity Training Script -- 8x MI300X (192 GB each, 1,536 GB total)
+Tryplicity Training Script -- 4x NVIDIA B200 (192 GB HBM3e each, 768 GB total)
 Distributed data-parallel training for the full 9.4B model.
 
-Default: 11 minutes at $15.92/hr = ~$2.92 ($10 model with setup overhead)
-Launch: torchrun --nproc_per_node=8 training/train_mi300x.py
+Launch: torchrun --nproc_per_node=4 training/train_b200.py
+Default: 11 minutes at $20.00/hr (4x $5.00/GPU) = ~$3.67
 
-Memory budget per MI300X (192 GB HBM3):
-    Model weights (bf16):       ~18.8 GB
-    Optimizer states (fp32):   ~112.8 GB  (fp32 copy + momentum + variance = 12 bytes/param)
-    Gradients (bf16):           ~18.8 GB
-    Activations (batch=2, grad ckpt ON): ~10 GB
-    DDP buffers + overhead:     ~10 GB
-    Total per GPU:             ~170 GB
-    Headroom:                   ~22 GB    (SAFE)
+Hardware per B200:
+    BF16 tensor:   ~2,250 TFLOPS
+    Mem bandwidth: 8 TB/s HBM3e
+    NVLink 5:      1.8 TB/s GPU-to-GPU
+    4x total:      ~9 PFLOPS BF16, 32 TB/s bandwidth
+
+Memory budget per B200 (192 GB HBM3e):
+    Model weights (fp32 + autocast):  ~37.6 GB  (9.4B x 4 bytes)
+    Optimizer (momentum + variance):  ~75.2 GB  (9.4B x 8 bytes)
+    Gradients (fp32):                 ~37.6 GB  (9.4B x 4 bytes)
+    Activations (batch=4, grad ckpt): ~20   GB
+    DDP buffers + overhead:           ~5    GB
+    -----------------------------------------------
+    Total per GPU:                    ~175  GB
+    Headroom:                         ~17   GB  (SAFE)
+
+    Note: fp32 weights + autocast bf16 forward uses the SAME total memory
+    as bf16 weights + fp32 optimizer master copy (150 GB base either way),
+    but avoids the bf16 buffer dtype bugs documented in CLAUDE.md.
 """
 
 import sys
@@ -41,7 +52,7 @@ from tokenizers import Tokenizer
 
 
 def setup_distributed():
-    """Initialize DDP. Works on both NCCL (NVIDIA) and RCCL (AMD ROCm)."""
+    """Initialize DDP with NCCL backend (NVIDIA)."""
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -79,37 +90,37 @@ def get_lr(step, total_steps, peak_lr, min_lr,
         return min_lr + 0.5 * (peak_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def train_mi300x(
+def train_b200(
     minutes: float = 11.0,
-    rate_per_hour: float = 15.92,
+    rate_per_hour: float = 20.00,
     data_dir: str = "./data",
     tokenizer_path: str = "./tokenizer/tryplicity.json",
     checkpoint_dir: str = "./checkpoints",
 ):
     """
-    Main training loop for 8x MI300X.
+    Main training loop for 4x NVIDIA B200.
 
-    With 8x MI300X and 1,536 GB total VRAM:
+    With 4x B200 and 768 GB total VRAM:
     - Full 9.4B model fits on each GPU via DDP (no sharding needed)
-    - No gradient checkpointing needed (saves compute)
-    - Batch size 4 per GPU (conservative for safety)
-    - Gradient accumulation 4 steps
-    - Effective batch = 4 seqs * 8 GPUs * 4 accum = 128 seqs = 524K tokens
+    - Gradient checkpointing ON to keep batch=4 under 192 GB
+    - Batch size 4 per GPU (B200 has 8 TB/s bandwidth — feeds big batches fast)
+    - Gradient accumulation 8 steps
+    - Effective batch = 4 seqs * 4 GPUs * 8 accum = 128 seqs = 524K tokens
     """
     # ---- Distributed setup ----
     local_rank = setup_distributed()
     world_size = dist.get_world_size()
     device = f"cuda:{local_rank}"
 
-    # Reduce memory fragmentation
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
     # ---- Config ----
-    # MEMORY CRITICAL: AdamW needs 12 bytes/param in fp32 = 112.8 GB for 9.4B model
-    # Must use batch=2 + gradient checkpointing to stay under 192 GB
-    batch_per_gpu = 2         # 2 seqs * 4096 tokens = 8K tokens/GPU
+    # B200: 192 GB HBM3e per GPU. With fp32 model + autocast:
+    #   Base (weights + optimizer + grads) = 150.4 GB
+    #   batch=4 + grad ckpt activations    = ~20 GB
+    #   DDP buffers                        = ~5 GB
+    #   Total                              = ~175 GB / 192 GB (17 GB headroom)
+    batch_per_gpu = 4         # 4 seqs * 4096 tokens = 16K tokens/GPU/micro-step
     max_seq_len = 4096
-    accumulation_steps = 8    # Effective batch = 2 * 8 * 8 = 128 seqs = 524K tokens
+    accumulation_steps = 8    # Effective batch = 4 * 4 * 8 = 128 seqs = 524K tokens
     peak_lr = 3e-3
     min_lr = 3e-5
     log_interval = 10
@@ -121,9 +132,9 @@ def train_mi300x(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     log("=" * 70)
-    log(f"TRYPLICITY TRAINING -- 8x MI300X")
+    log(f"TRYPLICITY TRAINING -- {world_size}x NVIDIA B200")
     log(f"Time: {minutes:.0f} minutes | Cost: ~${cost_estimate:.2f} at ${rate_per_hour:.2f}/hr")
-    log(f"GPUs: {world_size}x MI300X (192 GB each = {world_size * 192} GB total)")
+    log(f"GPUs: {world_size}x B200 (192 GB HBM3e each = {world_size * 192} GB total)")
     log(f"Batch: {batch_per_gpu}/GPU x {world_size} GPUs x {accumulation_steps} accum = {effective_batch_tokens:,} tokens/step")
     log(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log("=" * 70)
@@ -132,7 +143,7 @@ def train_mi300x(
     log("\nCreating full 9.4B parameter model...")
     model = create_full_model()
     # Gradient checkpointing ON -- saves ~30 GB activation memory per GPU
-    # Critical: without this, batch=2 activations + 150 GB base would exceed 192 GB
+    # Required: base memory is 150 GB + batch=4 activations need grad ckpt to fit in 192 GB
     model.gradient_checkpointing = True
     model = model.to(device)
 
@@ -142,7 +153,8 @@ def train_mi300x(
         log(f"  Trainable: {params['trainable']:,}")
         torch.cuda.reset_peak_memory_stats(device)
         allocated = torch.cuda.memory_allocated(device) / 1e9
-        log(f"  GPU {local_rank} memory after model load: {allocated:.2f} GB / 192 GB")
+        total_gpu_mem = torch.cuda.get_device_properties(local_rank).total_memory / 1e9
+        log(f"  GPU {local_rank} memory after model load: {allocated:.2f} GB / {total_gpu_mem:.0f} GB")
 
     # Wrap in DDP
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
@@ -154,7 +166,7 @@ def train_mi300x(
 
     if not data_files:
         log(f"ERROR: No .jsonl files in {data_dir}")
-        log("Run: python download_data.py")
+        log("Run: python download_data_mi300x.py")
         cleanup_distributed()
         return
 
@@ -197,21 +209,24 @@ def train_mi300x(
         after_optim = torch.cuda.memory_allocated(device) / 1e9
         total_gpu_mem = torch.cuda.get_device_properties(local_rank).total_memory / 1e9
         log(f"\n  GPU memory after optimizer: {after_optim:.2f} GB / {total_gpu_mem:.0f} GB")
-        log(f"  Headroom: {total_gpu_mem - after_optim:.1f} GB (need ~10 GB for activations w/ grad ckpt)")
+        log(f"  Headroom: {total_gpu_mem - after_optim:.1f} GB (need ~25 GB for batch=4 activations w/ grad ckpt)")
         if after_optim > total_gpu_mem * 0.9:
             log("  WARNING: Memory very tight! May OOM during forward pass")
-            log("  Consider using FSDP or reducing model size")
+            log("  Consider reducing batch_per_gpu to 2")
         elif after_optim > total_gpu_mem * 0.8:
             log("  CAUTION: Memory is usable but tight. Gradient checkpointing is ON.")
         else:
             log("  STATUS: Memory is SAFE")
 
     # Estimate total optimizer steps based on throughput
-    # 8x MI300X should do ~50K-100K tokens/sec
-    # In 11 min = 660 sec, at 80K tok/s = ~53M tokens
-    # At 524K tokens per optimizer step = ~100 steps
-    estimated_total_steps = max(50, int((minutes * 60 * 80000) / effective_batch_tokens))
-    log(f"\n  Estimated optimizer steps: {estimated_total_steps}")
+    # 4x B200 at ~2,250 TFLOPS each = ~9 PFLOPS total
+    # Expected throughput: ~200K-400K tokens/sec for our MoE+Mamba model
+    # Conservative 300K tok/s: 11 min = 660 sec = ~198M tokens
+    # At 524K tokens/step = ~378 optimizer steps
+    estimated_tok_per_sec = 300000
+    estimated_total_steps = max(50, int((minutes * 60 * estimated_tok_per_sec) / effective_batch_tokens))
+    log(f"\n  Estimated throughput: ~{estimated_tok_per_sec // 1000}K tokens/sec")
+    log(f"  Estimated optimizer steps: {estimated_total_steps}")
 
     # ---- Training loop ----
     log(f"\n{'='*70}")
@@ -242,7 +257,7 @@ def train_mi300x(
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
 
-                # Forward with bf16 autocast
+                # Forward with bf16 autocast (model stays fp32, autocast handles bf16 matmuls)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     raw_model = model.module
                     result = model(input_ids, labels=labels)
@@ -325,7 +340,7 @@ def train_mi300x(
 
                 # Checkpoint every ~3 minutes
                 if global_step > 0 and global_step % max(1, estimated_total_steps // 4) == 0 and is_main():
-                    ckpt = checkpoint_dir / f"mi300x_step{global_step}.pt"
+                    ckpt = checkpoint_dir / f"b200_step{global_step}.pt"
                     torch.save({
                         "model_state_dict": model.module.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -360,11 +375,12 @@ def train_mi300x(
 
     if torch.cuda.is_available():
         peak = torch.cuda.max_memory_allocated(device) / 1e9
-        log(f"  Peak GPU memory: {peak:.1f} GB / 192 GB")
+        total_gpu_mem = torch.cuda.get_device_properties(local_rank).total_memory / 1e9
+        log(f"  Peak GPU memory: {peak:.1f} GB / {total_gpu_mem:.0f} GB")
 
     # Save final model
     if is_main():
-        final = checkpoint_dir / "final_mi300x.pt"
+        final = checkpoint_dir / "final_b200.pt"
         torch.save({
             "model_state_dict": model.module.state_dict(),
             "global_step": global_step,
@@ -372,7 +388,7 @@ def train_mi300x(
             "best_loss": best_loss,
             "elapsed_seconds": elapsed,
             "cost_dollars": total_cost,
-            "hardware": f"{world_size}x_mi300x",
+            "hardware": f"{world_size}x_b200",
         }, final)
         log(f"  Model saved: {final}")
 
@@ -405,24 +421,24 @@ def train_mi300x(
     log(f"\n{'='*70}")
     log(f"DONE -- ${total_cost:.2f} spent")
     log(f"IMPORTANT: Download checkpoint before shutting down!")
-    log(f"  scp <pod>:./checkpoints/final_mi300x.pt ./")
+    log(f"  scp <pod>:./checkpoints/final_b200.pt ./")
     log(f"{'='*70}")
 
     cleanup_distributed()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Tryplicity on 8x MI300X")
+    parser = argparse.ArgumentParser(description="Train Tryplicity on 4x NVIDIA B200")
     parser.add_argument("--minutes", type=float, default=11.0,
                         help="Training time in minutes (default: 11)")
-    parser.add_argument("--rate", type=float, default=15.92,
-                        help="Hourly rate in dollars (default: 15.92)")
+    parser.add_argument("--rate", type=float, default=20.00,
+                        help="Hourly rate in dollars for all GPUs (default: 20.00)")
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--tokenizer", type=str, default="./tokenizer/tryplicity.json")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
     args = parser.parse_args()
 
-    train_mi300x(
+    train_b200(
         minutes=args.minutes,
         rate_per_hour=args.rate,
         data_dir=args.data_dir,
