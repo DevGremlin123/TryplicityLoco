@@ -2,105 +2,116 @@
 # ============================================================
 # TRYPLICITY — UNIVERSAL LAUNCHER
 #
-# Auto-detects your GPUs and picks the best strategy.
+# Data pipeline (can run anywhere):
+#   bash run.sh collect     <- Download ~200GB article data
+#   bash run.sh filter      <- Phase 1 (quality) + Phase 2 (article relevance)
+#   bash run.sh tokenizer   <- Build tokenizer from filtered data
 #
-#   bash run.sh prep      <- Download + AI filter + tokenizer
-#   bash run.sh train     <- Train (auto-detects DDP/FSDP/single)
-#   bash run.sh           <- Both back-to-back
+# Training (5x B200):
+#   bash run.sh train       <- Train model (~23 hrs on 5x B200)
+#   bash run.sh all         <- filter + tokenizer + train
 #
-# Works on ANY hardware: 1x RTX 5090, 5x B200, 8x H200, etc.
 # ============================================================
 
 set -e
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1
+export TOKENIZERS_PARALLELISM=false
 
-MODE="${1:-all}"
+MODE="${1:-help}"
 
-run_prep() {
+run_collect() {
     echo ""
-    echo "  TRYPLICITY — DATA PREPARATION"
-    echo "  [1] Check GPUs  [2] Install deps  [3] Download data"
-    echo "  [4] AI quality filter  [5] Build tokenizer"
+    echo "  TRYPLICITY — COLLECTING ~200GB ARTICLE DATA"
     echo ""
+    pip install -q datasets tokenizers tqdm numpy 2>/dev/null || true
+    python collect_data.py
+}
 
-    echo "  [1/5] GPUs"
-    python -c "
-import torch
-n = torch.cuda.device_count()
-print(f'  {n} GPUs found')
-for i in range(n):
-    name = torch.cuda.get_device_name(i)
-    mem = torch.cuda.get_device_properties(i).total_memory / 1e9
-    print(f'    GPU {i}: {name} ({mem:.0f} GB)')
-total = sum(torch.cuda.get_device_properties(i).total_memory for i in range(n)) / 1e9
-print(f'  Total VRAM: {total:.0f} GB')
-"
+run_filter() {
+    echo ""
+    echo "  TRYPLICITY — FILTERING DATA (Phase 1 + Phase 2)"
     echo ""
 
-    echo "  [2/5] Dependencies"
-    pip install -q torch datasets tokenizers transformers tqdm numpy sentencepiece 2>/dev/null || true
-    echo "  Done"
-    echo ""
+    pip install -q torch transformers 2>/dev/null || true
 
-    echo "  [3/5] Downloading data"
+    # Check for raw data
     if [ ! -d "data" ] || [ -z "$(ls data/*.jsonl 2>/dev/null)" ]; then
-        python download_data_mi300x.py
-    else
-        echo "  Data already present"
-        for f in data/*.jsonl; do [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") samples"; done
+        echo "  ERROR: No raw data. Run: bash run.sh collect"
+        exit 1
     fi
-    echo ""
 
-    echo "  [4/5] AI quality filter"
+    # Phase 1: Quality filter (GPU)
     if [ ! -d "data/filtered" ] || [ -z "$(ls data/filtered/*.jsonl 2>/dev/null)" ]; then
-        python filter_data_quality.py --data-dir ./data --output-dir ./data/filtered --threshold 3
+        echo "  ── Phase 1: Quality Filter (FineWeb-Edu classifier) ──"
+        python filter_data.py --phase 1 --data-dir ./data --threshold 3.0 --batch-size 512
     else
-        echo "  Filtered data already present"
-        for f in data/filtered/*.jsonl; do [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"; done
-    fi
-    echo ""
-
-    echo "  [5/5] Tokenizer"
-    if [ ! -f "tokenizer/tryplicity.json" ]; then
-        python training/build_tokenizer.py
-    else
-        echo "  Already built"
+        echo "  Phase 1 already done:"
+        for f in data/filtered/*.jsonl; do
+            [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
+        done
     fi
 
     echo ""
-    echo "  PREP COMPLETE — data saved to ./data/filtered/"
-    echo "  Run: bash run.sh train"
+
+    # Phase 2: Article relevance (CPU heuristics)
+    if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
+        echo "  ── Phase 2: Article Relevance Filter (heuristics) ──"
+        python filter_data.py --phase 2
+    else
+        echo "  Phase 2 already done:"
+        for f in data/final/*.jsonl; do
+            [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
+        done
+    fi
+
+    echo ""
+    echo "  FILTERING COMPLETE"
     echo ""
 }
 
-run_train() {
-    if [ ! -d "data/filtered" ] || [ -z "$(ls data/filtered/*.jsonl 2>/dev/null)" ]; then
-        echo "  ERROR: No filtered data. Run: bash run.sh prep"
+run_tokenizer() {
+    if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
+        echo "  ERROR: No filtered data. Run: bash run.sh filter"
         exit 1
     fi
-    if [ ! -f "tokenizer/tryplicity.json" ]; then
-        echo "  ERROR: No tokenizer. Run: bash run.sh prep"
+
+    echo "  Building tokenizer from filtered data..."
+    python training/build_tokenizer.py
+    echo "  Tokenizer built: tokenizer/tryplicity.json"
+}
+
+run_train() {
+    if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
+        echo "  ERROR: No filtered data. Run: bash run.sh filter"
         exit 1
+    fi
+
+    if [ ! -f "tokenizer/tryplicity.json" ]; then
+        echo "  Building tokenizer first..."
+        python training/build_tokenizer.py
     fi
 
     NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())")
 
+    echo ""
+    echo "  TRYPLICITY — TRAINING"
+    echo "  GPUs: ${NUM_GPUS} | Data: ./data/final/"
+    echo ""
+
     if [ "$NUM_GPUS" -gt 1 ]; then
-        echo "  Launching on ${NUM_GPUS} GPUs with torchrun..."
         torchrun --nproc_per_node=${NUM_GPUS} --master_port=29500 \
             training/train.py \
-            --minutes "${TRAIN_MINUTES:-11}" \
-            --rate "${TRAIN_RATE:-0}" \
-            --data-dir ./data/filtered \
+            --minutes "${TRAIN_MINUTES:-1380}" \
+            --rate "${TRAIN_RATE:-21.20}" \
+            --data-dir ./data/final \
             --tokenizer ./tokenizer/tryplicity.json \
             --checkpoint-dir ./checkpoints
     else
-        echo "  Launching on 1 GPU..."
         python training/train.py \
-            --minutes "${TRAIN_MINUTES:-30}" \
+            --minutes "${TRAIN_MINUTES:-1380}" \
             --rate "${TRAIN_RATE:-0}" \
-            --data-dir ./data/filtered \
+            --data-dir ./data/final \
             --tokenizer ./tokenizer/tryplicity.json \
             --checkpoint-dir ./checkpoints
     fi
@@ -111,9 +122,35 @@ run_train() {
     echo ""
 }
 
+run_all() {
+    run_filter
+    sleep 2
+    run_tokenizer
+    sleep 2
+    run_train
+}
+
 case "$MODE" in
-    prep) run_prep ;;
-    train) run_train ;;
-    all) run_prep; sleep 3; run_train ;;
-    *) echo "Usage: bash run.sh [prep|train|all]"; exit 1 ;;
+    collect)    run_collect ;;
+    filter)     run_filter ;;
+    tokenizer)  run_tokenizer ;;
+    train)      run_train ;;
+    all)        run_all ;;
+    help|*)
+        echo ""
+        echo "  TRYPLICITY LAUNCHER"
+        echo ""
+        echo "  Data pipeline:"
+        echo "    bash run.sh collect     Download ~200GB article data"
+        echo "    bash run.sh filter      Phase 1 (quality) + Phase 2 (relevance)"
+        echo "    bash run.sh tokenizer   Build tokenizer from filtered data"
+        echo ""
+        echo "  Training (5x B200, \$21.20/hr):"
+        echo "    bash run.sh train       Train model (~23 hrs)"
+        echo "    bash run.sh all         filter + tokenizer + train"
+        echo ""
+        echo "  Env vars:"
+        echo "    TRAIN_MINUTES=1380  TRAIN_RATE=21.20  bash run.sh train"
+        echo ""
+        ;;
 esac
