@@ -6,6 +6,8 @@
 #   bash run.sh collect     <- Download ~200GB article data
 #   bash run.sh filter      <- 5-judge AI filter (2 rounds)
 #   bash run.sh tokenizer   <- Build tokenizer from clean data
+#   bash run.sh upload      <- Upload filtered data to HuggingFace
+#   bash run.sh download    <- Download filtered data from HuggingFace
 #
 # Training (5x B200):
 #   bash run.sh train       <- Train model (~23 hrs)
@@ -154,6 +156,60 @@ run_train() {
     echo ""
 }
 
+run_upload() {
+    HF_REPO="${HF_REPO:-DevGremlin123/tryplicity-data}"
+    pip install -q huggingface-hub 2>/dev/null || true
+
+    echo ""
+    echo "  TRYPLICITY — UPLOADING DATA TO HUGGINGFACE"
+    echo "  Repo: ${HF_REPO}"
+    echo ""
+
+    if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
+        echo "  ERROR: No filtered data in data/final/. Run: bash run.sh filter"
+        exit 1
+    fi
+
+    # Upload filtered data
+    echo "  Uploading data/final/ ..."
+    huggingface-cli upload "${HF_REPO}" ./data/final --repo-type dataset --path-in-repo final
+
+    # Upload tokenizer if it exists
+    if [ -f "tokenizer/tryplicity.json" ]; then
+        echo "  Uploading tokenizer..."
+        huggingface-cli upload "${HF_REPO}" ./tokenizer --repo-type dataset --path-in-repo tokenizer
+    fi
+
+    echo ""
+    echo "  UPLOAD COMPLETE"
+    echo "  On any new pod: bash run.sh download"
+    echo ""
+}
+
+run_download() {
+    HF_REPO="${HF_REPO:-DevGremlin123/tryplicity-data}"
+    pip install -q huggingface-hub 2>/dev/null || true
+
+    echo ""
+    echo "  TRYPLICITY — DOWNLOADING DATA FROM HUGGINGFACE"
+    echo "  Repo: ${HF_REPO}"
+    echo ""
+
+    mkdir -p data/final tokenizer
+
+    echo "  Downloading filtered data..."
+    huggingface-cli download "${HF_REPO}" --repo-type dataset --include "final/*" --local-dir ./data
+
+    if huggingface-cli download "${HF_REPO}" --repo-type dataset --include "tokenizer/*" --local-dir ./tokenizer 2>/dev/null; then
+        echo "  Tokenizer downloaded."
+    fi
+
+    echo ""
+    echo "  DOWNLOAD COMPLETE — data/final/ is ready"
+    echo "  Next: bash run.sh train"
+    echo ""
+}
+
 run_all() {
     run_filter
     sleep 2
@@ -166,6 +222,8 @@ case "$MODE" in
     collect)    run_collect ;;
     filter)     run_filter ;;
     tokenizer)  run_tokenizer ;;
+    upload)     run_upload ;;
+    download)   run_download ;;
     train)      run_train ;;
     all)        run_all ;;
     help|*)
@@ -176,6 +234,8 @@ case "$MODE" in
         echo "    bash run.sh collect     Download ~200GB article data"
         echo "    bash run.sh filter      5-judge AI filter (2 rounds)"
         echo "    bash run.sh tokenizer   Build tokenizer"
+        echo "    bash run.sh upload      Upload filtered data to HuggingFace"
+        echo "    bash run.sh download    Download filtered data from HuggingFace"
         echo ""
         echo "  Training (5x B200, \$21.20/hr):"
         echo "    bash run.sh train       Train model (~23 hrs)"
