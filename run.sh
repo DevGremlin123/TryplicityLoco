@@ -4,18 +4,22 @@
 #
 # Data pipeline:
 #   bash run.sh collect     <- Download ~200GB article data
-#   bash run.sh filter      <- 4-phase deep clean (GPU + CPU)
+#   bash run.sh filter      <- 5-judge AI filter (2 rounds)
 #   bash run.sh tokenizer   <- Build tokenizer from clean data
 #
 # Training (5x B200):
-#   bash run.sh train       <- Train model (~23 hrs on 5x B200)
+#   bash run.sh train       <- Train model (~23 hrs)
 #   bash run.sh all         <- filter + tokenizer + train
 #
-# Filter phases:
-#   Phase 1: Quality classifier (threshold >= 3.0)
-#   Phase 2: Quality classifier (stricter, >= 3.5)
-#   Phase 3: Article heuristics (standard)
-#   Phase 4: Article heuristics (strict — only the best)
+# 5 AI Judges (all run simultaneously on 10 GPUs):
+#   1. FineWeb-Edu classifier  — Educational quality
+#   2. CoLA grammar checker    — Grammatical acceptability
+#   3. Toxic-BERT              — Toxicity detection
+#   4. OpenAI GPT detector     — AI slop detection
+#   5. Formality ranker        — Writing professionalism
+#
+# Round 1: Keep docs with >= 3/5 judge votes
+# Round 2: Keep docs with >= 4/5 judge votes (only the best)
 #
 # ============================================================
 
@@ -36,16 +40,19 @@ run_collect() {
 
 run_filter() {
     echo ""
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║  TRYPLICITY — 4-PHASE DEEP CLEAN            ║"
-    echo "  ║                                              ║"
-    echo "  ║  Phase 1: Quality classifier (>= 3.0)  GPU  ║"
-    echo "  ║  Phase 2: Quality classifier (>= 3.5)  GPU  ║"
-    echo "  ║  Phase 3: Article heuristics (standard) CPU  ║"
-    echo "  ║  Phase 4: Article heuristics (strict)   CPU  ║"
-    echo "  ║                                              ║"
-    echo "  ║  Only the purest data survives.              ║"
-    echo "  ╚══════════════════════════════════════════════╝"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║  TRYPLICITY — 5-JUDGE AI FILTER                  ║"
+    echo "  ║                                                  ║"
+    echo "  ║  Judge 1: Educational quality (FineWeb-Edu)      ║"
+    echo "  ║  Judge 2: Grammar (CoLA)                         ║"
+    echo "  ║  Judge 3: Toxicity (Toxic-BERT)                  ║"
+    echo "  ║  Judge 4: AI slop (GPT detector)                 ║"
+    echo "  ║  Judge 5: Formality (writing professionalism)    ║"
+    echo "  ║                                                  ║"
+    echo "  ║  Round 1: >= 3/5 votes to survive                ║"
+    echo "  ║  Round 2: >= 4/5 votes to survive                ║"
+    echo "  ║  Only the purest data remains.                   ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
     echo ""
 
     pip install -q torch transformers 2>/dev/null || true
@@ -56,58 +63,37 @@ run_filter() {
         exit 1
     fi
 
-    # Phase 1: Quality classifier (broad)
-    if [ ! -d "data/phase1" ] || [ -z "$(ls data/phase1/*.jsonl 2>/dev/null)" ]; then
-        echo "  ── PHASE 1/4: Quality Classifier (threshold >= 3.0) ──"
-        python filter_data.py --phase 1
+    # Round 1: Broad pass (3/5 votes)
+    if [ ! -d "data/round1" ] || [ -z "$(ls data/round1/*.jsonl 2>/dev/null)" ]; then
+        echo "  ── ROUND 1: 5 judges, keep >= 3/5 votes ──"
+        echo ""
+        python filter_data.py --round 1
     else
-        echo "  Phase 1 already done:"
-        for f in data/phase1/*.jsonl; do
+        echo "  Round 1 already done:"
+        for f in data/round1/*.jsonl; do
             [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
         done
+        echo ""
     fi
-    echo ""
 
-    # Phase 2: Quality classifier (strict)
-    if [ ! -d "data/phase2" ] || [ -z "$(ls data/phase2/*.jsonl 2>/dev/null)" ]; then
-        echo "  ── PHASE 2/4: Quality Classifier (threshold >= 3.5) ──"
-        python filter_data.py --phase 2
-    else
-        echo "  Phase 2 already done:"
-        for f in data/phase2/*.jsonl; do
-            [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
-        done
-    fi
-    echo ""
-
-    # Phase 3: Article heuristics (standard)
-    if [ ! -d "data/phase3" ] || [ -z "$(ls data/phase3/*.jsonl 2>/dev/null)" ]; then
-        echo "  ── PHASE 3/4: Article Heuristics (standard) ──"
-        python filter_data.py --phase 3
-    else
-        echo "  Phase 3 already done:"
-        for f in data/phase3/*.jsonl; do
-            [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
-        done
-    fi
-    echo ""
-
-    # Phase 4: Article heuristics (strict — only the best)
+    # Round 2: Strict pass (4/5 votes)
     if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
-        echo "  ── PHASE 4/4: Article Heuristics (STRICT — only the best) ──"
-        python filter_data.py --phase 4
+        echo "  ── ROUND 2: 5 judges again, keep >= 4/5 votes ──"
+        echo ""
+        python filter_data.py --round 2
     else
-        echo "  Phase 4 already done:"
+        echo "  Round 2 already done:"
         for f in data/final/*.jsonl; do
             [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
         done
+        echo ""
     fi
 
     echo ""
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║  4-PHASE FILTERING COMPLETE                  ║"
-    echo "  ║  Only the purest data remains in data/final/ ║"
-    echo "  ╚══════════════════════════════════════════════╝"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║  FILTERING COMPLETE                              ║"
+    echo "  ║  Only the purest data remains in data/final/     ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
     echo ""
     echo "  Final data:"
     for f in data/final/*.jsonl; do
@@ -188,7 +174,7 @@ case "$MODE" in
         echo ""
         echo "  Data pipeline:"
         echo "    bash run.sh collect     Download ~200GB article data"
-        echo "    bash run.sh filter      4-phase deep clean"
+        echo "    bash run.sh filter      5-judge AI filter (2 rounds)"
         echo "    bash run.sh tokenizer   Build tokenizer"
         echo ""
         echo "  Training (5x B200, \$21.20/hr):"

@@ -1,203 +1,159 @@
 """
-Tryplicity Data Filter — 4-phase deep cleaning pipeline.
+Tryplicity 5-Judge AI Filter — Real models, no heuristics.
 
-Phase 1: Quality classifier (FineWeb-Edu, threshold >= 3.0)    GPU
-Phase 2: Quality classifier (stricter, threshold >= 3.5)       GPU
-Phase 3: Article heuristics (standard rules)                   CPU
-Phase 4: Article heuristics (strict rules — only the best)     CPU
+5 AI judges score every document. Majority vote decides.
 
-Data flow:
-  data/*.jsonl → data/phase1/ → data/phase2/ → data/phase3/ → data/final/
+  Judge 1: FineWeb-Edu classifier    — Educational quality (0-5)
+  Judge 2: CoLA grammar checker      — Grammatical acceptability
+  Judge 3: Toxic-BERT                — Toxicity detection (reject toxic)
+  Judge 4: OpenAI GPT detector       — AI slop detection (reject AI-generated)
+  Judge 5: Formality ranker          — Writing formality/professionalism
+
+Architecture:
+  10 GPUs, 2 per judge. All 5 judges run simultaneously.
+  Each GPU processes half the documents independently.
+  After all judges finish, merge votes with majority rule.
+
+Two rounds:
+  Round 1: Keep docs with >= 3/5 votes (broad pass)
+  Round 2: Keep docs with >= 4/5 votes (strict pass — only the best)
 
 Usage:
-  python filter_data.py --phase 1    # or 2, 3, 4
-  bash run.sh filter                 # runs all 4 phases
+  python filter_data.py --round 1 --data-dir ./data
+  python filter_data.py --round 2
+  bash run.sh filter              # runs both rounds
 """
 
-import argparse, json, os, re, time, sys
+import argparse, json, time, sys
 from pathlib import Path
 import multiprocessing as mp
 
 
-# ── Article heuristics ───────────────────────────────────────────
+# ── Judge definitions ────────────────────────────────────────────
 
-def is_article_quality(text, strict=False):
+JUDGES = [
+    {
+        "name": "educational_quality",
+        "model_id": "HuggingFaceFW/fineweb-edu-classifier",
+        "desc": "Educational quality (FineWeb-Edu)",
+        "type": "regression",       # outputs float 0-5
+        "pass_fn": "score >= 3.0",  # round 1
+        "pass_fn_strict": "score >= 3.5",  # round 2
+    },
+    {
+        "name": "grammar",
+        "model_id": "textattack/distilbert-base-uncased-CoLA",
+        "desc": "Grammar acceptability (CoLA)",
+        "type": "classification",   # outputs logits for [unacceptable, acceptable]
+        "pass_label": 1,            # label 1 = acceptable
+    },
+    {
+        "name": "toxicity",
+        "model_id": "unitary/toxic-bert",
+        "desc": "Toxicity detection (reject toxic)",
+        "type": "classification",   # outputs logits for [not_toxic, toxic]
+        "pass_label": 0,            # label 0 = not toxic (we KEEP non-toxic)
+    },
+    {
+        "name": "ai_slop",
+        "model_id": "openai-community/roberta-base-openai-detector",
+        "desc": "AI-generated text detector (reject AI slop)",
+        "type": "classification",   # outputs logits for [Real, Fake]
+        "pass_label": 0,            # label 0 = Real/human-written (we KEEP human)
+    },
+    {
+        "name": "formality",
+        "model_id": "s-nlp/roberta-base-formality-ranker",
+        "desc": "Writing formality (keep formal/professional)",
+        "type": "regression",       # outputs formality score
+        "pass_fn": "score >= 0.5",  # above midpoint = formal
+        "pass_fn_strict": "score >= 0.6",
+    },
+]
+
+
+# ── Judge worker ─────────────────────────────────────────────────
+
+def judge_worker(gpu_id, judge_idx, num_gpus_per_judge, gpu_offset,
+                 input_files, scores_dir, batch_size, is_strict):
     """
-    Check if text has the structure of a well-written article.
-    strict=False: standard pass (Phase 3)
-    strict=True:  tight pass (Phase 4) — only the purest prose survives
+    Run one judge on assigned GPU, scoring all documents.
+    Writes a scores file: one line per doc with 0 (fail) or 1 (pass).
     """
-    # --- Thresholds ---
-    if strict:
-        min_chars = 800
-        min_paragraphs = 4
-        min_para_words, max_para_words = 50, 400
-        min_sent_words, max_sent_words = 12, 28
-        max_code_ratio = 0.03
-        max_list_ratio = 0.15
-        min_sentences = 8
-        min_punct = 8
-        max_repeats = 2
-    else:
-        min_chars = 500
-        min_paragraphs = 3
-        min_para_words, max_para_words = 30, 600
-        min_sent_words, max_sent_words = 10, 35
-        max_code_ratio = 0.05
-        max_list_ratio = 0.25
-        min_sentences = 5
-        min_punct = 5
-        max_repeats = 3
-
-    if len(text) < min_chars:
-        return False
-
-    # Split into paragraphs
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    if len(paragraphs) < min_paragraphs:
-        return False
-
-    # Check paragraph lengths (words)
-    para_word_counts = [len(p.split()) for p in paragraphs]
-    avg_para_words = sum(para_word_counts) / len(para_word_counts)
-    if avg_para_words < min_para_words or avg_para_words > max_para_words:
-        return False
-
-    # Sentence analysis
-    sentences = re.split(r'[.!?]+', text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-    if len(sentences) < min_sentences:
-        return False
-
-    avg_sent_words = sum(len(s.split()) for s in sentences) / max(1, len(sentences))
-    if avg_sent_words < min_sent_words or avg_sent_words > max_sent_words:
-        return False
-
-    # Code/markup ratio
-    code_chars = sum(c in '{}[]()<>|\\/@#$%^&*=+~`' for c in text)
-    if code_chars / len(text) > max_code_ratio:
-        return False
-
-    # Bullet/list ratio
-    list_lines = sum(1 for line in text.split('\n')
-                     if line.strip().startswith(('-', '*', '•', '1.', '2.', '3.')))
-    total_lines = max(1, len(text.split('\n')))
-    if list_lines / total_lines > max_list_ratio:
-        return False
-
-    # Repetition check
-    seen = {}
-    for s in sentences:
-        key = s.lower().strip()[:100]
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] >= max_repeats:
-            return False
-
-    # Must have sentence-ending punctuation (proper prose)
-    punct_count = text.count('.') + text.count('!') + text.count('?')
-    if punct_count < min_punct:
-        return False
-
-    # --- Strict-only checks ---
-    if strict:
-        # Vocabulary diversity: unique words / total words > 0.3
-        words = text.lower().split()
-        if len(words) > 50:
-            diversity = len(set(words)) / len(words)
-            if diversity < 0.30:
-                return False
-
-        # No excessive caps (SHOUTING)
-        caps_words = sum(1 for w in words if w.isupper() and len(w) > 2)
-        if caps_words / max(1, len(words)) > 0.05:
-            return False
-
-        # Paragraph length variance — good articles have varied paragraph sizes
-        if len(para_word_counts) >= 3:
-            mean_wc = sum(para_word_counts) / len(para_word_counts)
-            variance = sum((wc - mean_wc) ** 2 for wc in para_word_counts) / len(para_word_counts)
-            # If all paragraphs are exactly the same length, it's likely template/generated
-            if variance < 10:
-                return False
-
-    return True
-
-
-# ── GPU worker (Phases 1 & 2) ───────────────────────────────────
-
-def classifier_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_size):
-    """Classify documents using FineWeb-Edu classifier on assigned GPU."""
     import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+    judge = JUDGES[judge_idx]
+    # Which slice of documents this GPU handles
+    local_rank = gpu_id - gpu_offset  # 0 or 1 within this judge's GPU pair
 
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(gpu_id)
 
-    print(f"  [GPU {gpu_id}] Loading FineWeb-Edu classifier...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceFW/fineweb-edu-classifier")
+    print(f"  [GPU {gpu_id}] Loading {judge['name']}: {judge['model_id']}...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(judge["model_id"])
     model = AutoModelForSequenceClassification.from_pretrained(
-        "HuggingFaceFW/fineweb-edu-classifier"
+        judge["model_id"]
     ).to(device).eval()
-    print(f"  [GPU {gpu_id}] Ready. Threshold: {threshold}", flush=True)
+    print(f"  [GPU {gpu_id}] {judge['name']} ready.", flush=True)
 
-    gpu_dir = Path(output_dir) / f"_gpu{gpu_id}"
-    gpu_dir.mkdir(parents=True, exist_ok=True)
+    judge_dir = Path(scores_dir) / judge["name"]
+    judge_dir.mkdir(parents=True, exist_ok=True)
 
     total_processed = 0
-    total_kept = 0
+    total_passed = 0
 
     for input_file in input_files:
         fname = Path(input_file).name
-        out_file = gpu_dir / fname
+        score_file = judge_dir / f"gpu{gpu_id}_{fname}.scores"
 
         texts_batch = []
-        lines_batch = []
+        line_indices = []
 
         with open(input_file, "r", encoding="utf-8") as fin, \
-             open(out_file, "w", encoding="utf-8") as fout:
+             open(score_file, "w") as fout:
 
             for line_num, raw_line in enumerate(fin):
-                if line_num % num_gpus != gpu_id:
+                # Interleaved sharding across this judge's GPUs
+                if line_num % num_gpus_per_judge != local_rank:
                     continue
 
                 try:
                     data = json.loads(raw_line)
                     text = data.get("text", "")
                 except (json.JSONDecodeError, KeyError):
+                    fout.write(f"{line_num}\t0\n")
                     continue
 
                 texts_batch.append(text[:2000])
-                lines_batch.append(raw_line)
+                line_indices.append(line_num)
 
                 if len(texts_batch) >= batch_size:
-                    kept = _classify_and_write(
-                        model, tokenizer, texts_batch, lines_batch,
-                        fout, device, threshold
-                    )
-                    total_processed += len(texts_batch)
-                    total_kept += kept
-                    texts_batch, lines_batch = [], []
+                    results = _score_batch(model, tokenizer, texts_batch,
+                                           device, judge, is_strict)
+                    for idx, passed in zip(line_indices, results):
+                        fout.write(f"{idx}\t{1 if passed else 0}\n")
+                        total_processed += 1
+                        total_passed += 1 if passed else 0
+                    texts_batch, line_indices = [], []
 
+            # Flush remaining
             if texts_batch:
-                kept = _classify_and_write(
-                    model, tokenizer, texts_batch, lines_batch,
-                    fout, device, threshold
-                )
-                total_processed += len(texts_batch)
-                total_kept += kept
+                results = _score_batch(model, tokenizer, texts_batch,
+                                       device, judge, is_strict)
+                for idx, passed in zip(line_indices, results):
+                    fout.write(f"{idx}\t{1 if passed else 0}\n")
+                    total_processed += 1
+                    total_passed += 1 if passed else 0
 
-        if total_processed > 0:
-            print(f"  [GPU {gpu_id}] {fname}: {total_kept:,} / {total_processed:,} kept", flush=True)
-
-    pct = (total_kept / max(1, total_processed)) * 100
-    print(f"  [GPU {gpu_id}] DONE — {total_kept:,} / {total_processed:,} ({pct:.0f}%)", flush=True)
+    pct = (total_passed / max(1, total_processed)) * 100
+    print(f"  [GPU {gpu_id}] {judge['name']}: {total_passed:,} / {total_processed:,} passed ({pct:.0f}%)", flush=True)
 
 
-def _classify_and_write(model, tokenizer, texts, lines, fout, device, threshold):
-    """Score a batch of texts and write passing ones."""
+def _score_batch(model, tokenizer, texts, device, judge, is_strict):
+    """Score a batch and return list of bool (pass/fail)."""
     import torch
 
-    kept = 0
     try:
         inputs = tokenizer(
             texts,
@@ -209,163 +165,141 @@ def _classify_and_write(model, tokenizer, texts, lines, fout, device, threshold)
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = model(**inputs).logits
+
+        if judge["type"] == "regression":
             scores = logits.squeeze(-1).float().cpu().tolist()
+            if isinstance(scores, float):
+                scores = [scores]
 
-        if isinstance(scores, float):
-            scores = [scores]
+            if is_strict and "pass_fn_strict" in judge:
+                threshold = float(judge["pass_fn_strict"].split(">=")[1].strip())
+            else:
+                threshold = float(judge["pass_fn"].split(">=")[1].strip())
 
-        for score, line in zip(scores, lines):
-            if score >= threshold:
-                fout.write(line)
-                kept += 1
+            return [s >= threshold for s in scores]
+
+        else:  # classification
+            probs = torch.softmax(logits.float(), dim=-1).cpu()
+            pass_label = judge["pass_label"]
+            return [probs[i, pass_label].item() > 0.5 for i in range(len(texts))]
+
     except Exception as e:
-        for line in lines:
-            fout.write(line)
-        kept = len(lines)
-        print(f"  WARNING: Batch error ({e}), kept all {len(lines)} docs", flush=True)
-
-    return kept
+        print(f"  WARNING: Batch error in {judge['name']} ({e}), marking all as pass", flush=True)
+        return [True] * len(texts)
 
 
-# ── CPU worker (Phases 3 & 4) ───────────────────────────────────
+# ── Merge votes and output ───────────────────────────────────────
 
-def heuristic_worker(worker_id, num_workers, input_files, output_dir, strict):
-    """Filter documents using article-quality heuristics."""
-    worker_dir = Path(output_dir) / f"_worker{worker_id}"
-    worker_dir.mkdir(parents=True, exist_ok=True)
+def merge_votes(input_files, scores_dir, output_dir, min_votes):
+    """
+    Read all judge score files, count votes per document,
+    keep documents with >= min_votes passing judges.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scores_dir = Path(scores_dir)
 
-    total_processed = 0
-    total_kept = 0
+    total_input = 0
+    total_output = 0
 
     for input_file in input_files:
         fname = Path(input_file).name
-        out_file = worker_dir / fname
 
+        # Collect votes from all judges
+        votes = {}  # line_num -> count of passing votes
+        for judge in JUDGES:
+            judge_dir = scores_dir / judge["name"]
+            for score_file in sorted(judge_dir.glob(f"*_{fname}.scores")):
+                with open(score_file, "r") as f:
+                    for line in f:
+                        parts = line.strip().split("\t")
+                        if len(parts) == 2:
+                            line_num = int(parts[0])
+                            passed = int(parts[1])
+                            votes[line_num] = votes.get(line_num, 0) + passed
+
+        # Write surviving documents
+        out_file = output_dir / fname
+        kept = 0
         with open(input_file, "r", encoding="utf-8") as fin, \
              open(out_file, "w", encoding="utf-8") as fout:
-
             for line_num, raw_line in enumerate(fin):
-                if line_num % num_workers != worker_id:
-                    continue
-
-                try:
-                    data = json.loads(raw_line)
-                    text = data.get("text", "")
-                except (json.JSONDecodeError, KeyError):
-                    continue
-
-                total_processed += 1
-
-                if is_article_quality(text, strict=strict):
+                total_input += 1
+                if votes.get(line_num, 0) >= min_votes:
                     fout.write(raw_line)
-                    total_kept += 1
+                    kept += 1
+                    total_output += 1
 
-    pct = (total_kept / max(1, total_processed)) * 100
-    print(f"  [Worker {worker_id}] DONE — {total_kept:,} / {total_processed:,} ({pct:.0f}%)", flush=True)
+        print(f"    {fname}: {kept:,} docs survived (>= {min_votes}/5 votes)", flush=True)
 
-
-# ── Merge outputs ────────────────────────────────────────────────
-
-def merge_outputs(output_dir, num_workers, input_files, prefix="_gpu"):
-    """Merge per-worker output files into single files per source."""
-    output_dir = Path(output_dir)
-
-    for input_file in input_files:
-        fname = Path(input_file).name
-        merged = output_dir / fname
-        total_lines = 0
-
-        with open(merged, "w", encoding="utf-8") as fout:
-            for wid in range(num_workers):
-                part = output_dir / f"{prefix}{wid}" / fname
-                if part.exists():
-                    with open(part, "r", encoding="utf-8") as fin:
-                        for line in fin:
-                            fout.write(line)
-                            total_lines += 1
-
-        print(f"    {fname}: {total_lines:,} docs", flush=True)
-
-    # Cleanup temp directories
-    for wid in range(num_workers):
-        temp_dir = output_dir / f"{prefix}{wid}"
-        if temp_dir.exists():
-            import shutil
-            shutil.rmtree(temp_dir)
-
-
-# ── Phase configs ────────────────────────────────────────────────
-
-PHASES = {
-    1: {
-        "name": "QUALITY FILTER (broad)",
-        "type": "classifier",
-        "threshold": 3.0,
-        "input_dir": "data",
-        "output_dir": "data/phase1",
-    },
-    2: {
-        "name": "QUALITY FILTER (strict)",
-        "type": "classifier",
-        "threshold": 3.5,
-        "input_dir": "data/phase1",
-        "output_dir": "data/phase2",
-    },
-    3: {
-        "name": "ARTICLE HEURISTICS (standard)",
-        "type": "heuristic",
-        "strict": False,
-        "input_dir": "data/phase2",
-        "output_dir": "data/phase3",
-    },
-    4: {
-        "name": "ARTICLE HEURISTICS (strict — only the best)",
-        "type": "heuristic",
-        "strict": True,
-        "input_dir": "data/phase3",
-        "output_dir": "data/final",
-    },
-}
+    return total_input, total_output
 
 
 # ── Main ─────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Tryplicity 4-Phase Data Filter")
-    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4], required=True,
-                        help="1-2 = quality classifier (GPU), 3-4 = article heuristics (CPU)")
+    parser = argparse.ArgumentParser(description="Tryplicity 5-Judge AI Filter")
+    parser.add_argument("--round", type=int, choices=[1, 2], required=True,
+                        help="1 = broad pass (3/5 votes), 2 = strict pass (4/5 votes)")
     parser.add_argument("--data-dir", type=str, default=None,
-                        help="Override input directory")
+                        help="Input directory (default: auto based on round)")
     parser.add_argument("--output-dir", type=str, default=None,
-                        help="Override output directory")
-    parser.add_argument("--threshold", type=float, default=None,
-                        help="Phases 1-2: override quality score threshold")
+                        help="Output directory (default: auto based on round)")
     parser.add_argument("--batch-size", type=int, default=512,
-                        help="Phases 1-2: batch size per GPU (default: 512)")
-    parser.add_argument("--workers", type=int, default=None,
-                        help="Phases 3-4: number of CPU workers (default: auto)")
+                        help="Batch size per GPU (default: 512)")
     args = parser.parse_args()
 
-    cfg = PHASES[args.phase]
-    input_dir = Path(args.data_dir or cfg["input_dir"])
-    output_dir = Path(args.output_dir or cfg["output_dir"])
+    if args.round == 1:
+        input_dir = Path(args.data_dir or "data")
+        output_dir = Path(args.output_dir or "data/round1")
+        scores_dir = Path("data/.scores_r1")
+        min_votes = 3
+        is_strict = False
+    else:
+        input_dir = Path(args.data_dir or "data/round1")
+        output_dir = Path(args.output_dir or "data/final")
+        scores_dir = Path("data/.scores_r2")
+        min_votes = 4
+        is_strict = True
 
     input_files = sorted(input_dir.glob("*.jsonl"))
     if not input_files:
         print(f"  ERROR: No .jsonl files in {input_dir}")
-        if args.phase > 1:
-            print(f"  Run phase {args.phase - 1} first.")
+        if args.round == 2:
+            print("  Run round 1 first: python filter_data.py --round 1")
         sys.exit(1)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    scores_dir.mkdir(parents=True, exist_ok=True)
 
-    # Count input docs
+    # Detect GPUs
+    try:
+        import torch
+        num_gpus = torch.cuda.device_count()
+    except ImportError:
+        print("  ERROR: pip install torch transformers")
+        sys.exit(1)
+
+    if num_gpus < 5:
+        print(f"  WARNING: {num_gpus} GPUs found, need 10 for full speed (2 per judge).")
+        print(f"  Will run judges sequentially on available GPUs.")
+
+    # Count input
     total_input = 0
     print()
-    print(f"  PHASE {args.phase}/4: {cfg['name']}")
-    print(f"  Input:  {input_dir} ({len(input_files)} files)")
-    print(f"  Output: {output_dir}")
+    print(f"  ╔══════════════════════════════════════════════════╗")
+    print(f"  ║  TRYPLICITY — 5-JUDGE AI FILTER (Round {args.round})        ║")
+    print(f"  ║                                                  ║")
+    for j in JUDGES:
+        print(f"  ║  {j['name']:24s} {j['desc']:24s} ║")
+    print(f"  ║                                                  ║")
+    print(f"  ║  Majority vote: >= {min_votes}/5 to survive               ║")
+    print(f"  ╚══════════════════════════════════════════════════╝")
     print()
+    print(f"  Input:  {input_dir}")
+    print(f"  Output: {output_dir}")
+    print(f"  GPUs:   {num_gpus}")
+    print()
+
     print("  Input files:")
     for f in input_files:
         n = sum(1 for _ in open(f, "r", encoding="utf-8"))
@@ -376,87 +310,101 @@ def main():
 
     t0 = time.time()
 
-    if cfg["type"] == "classifier":
-        threshold = args.threshold if args.threshold is not None else cfg["threshold"]
-
-        try:
-            import torch
-            num_gpus = torch.cuda.device_count()
-        except ImportError:
-            print("  ERROR: PyTorch not installed. pip install torch")
-            sys.exit(1)
-
-        if num_gpus == 0:
-            print("  ERROR: No CUDA GPUs found. Phases 1-2 require GPU.")
-            sys.exit(1)
-
-        print(f"  {num_gpus} GPUs | Batch: {args.batch_size} | Threshold: {threshold}")
+    if num_gpus >= 10:
+        # Ideal: 2 GPUs per judge, all 5 run simultaneously
+        gpus_per_judge = 2
+        print(f"  Running all 5 judges in parallel (2 GPUs each)...")
         print()
 
         processes = []
-        for gpu_id in range(num_gpus):
+        for judge_idx in range(5):
+            gpu_offset = judge_idx * gpus_per_judge
+            for local in range(gpus_per_judge):
+                gpu_id = gpu_offset + local
+                p = mp.Process(
+                    target=judge_worker,
+                    args=(gpu_id, judge_idx, gpus_per_judge, gpu_offset,
+                          [str(f) for f in input_files], str(scores_dir),
+                          args.batch_size, is_strict)
+                )
+                p.start()
+                processes.append(p)
+
+        for p in processes:
+            p.join()
+
+    elif num_gpus >= 5:
+        # 1 GPU per judge, all 5 run simultaneously
+        print(f"  Running all 5 judges in parallel (1 GPU each)...")
+        print()
+
+        processes = []
+        for judge_idx in range(5):
+            gpu_id = judge_idx
             p = mp.Process(
-                target=classifier_worker,
-                args=(gpu_id, num_gpus, [str(f) for f in input_files],
-                      str(output_dir), threshold, args.batch_size)
+                target=judge_worker,
+                args=(gpu_id, judge_idx, 1, gpu_id,
+                      [str(f) for f in input_files], str(scores_dir),
+                      args.batch_size, is_strict)
             )
             p.start()
             processes.append(p)
 
         for p in processes:
             p.join()
-
-        print()
-        print("  Merging GPU outputs...")
-        merge_outputs(output_dir, num_gpus, [str(f) for f in input_files], prefix="_gpu")
 
     else:
-        strict = cfg["strict"]
-        num_workers = args.workers or min(mp.cpu_count(), 16)
-        print(f"  {num_workers} CPU workers | Mode: {'STRICT' if strict else 'standard'}")
+        # Fewer GPUs: run judges sequentially, spread across available GPUs
+        print(f"  Running 5 judges sequentially across {num_gpus} GPUs...")
         print()
 
-        processes = []
-        for wid in range(num_workers):
-            p = mp.Process(
-                target=heuristic_worker,
-                args=(wid, num_workers, [str(f) for f in input_files],
-                      str(output_dir), strict)
-            )
-            p.start()
-            processes.append(p)
+        for judge_idx in range(5):
+            print(f"  --- Judge {judge_idx+1}/5: {JUDGES[judge_idx]['name']} ---")
+            processes = []
+            for gpu_id in range(num_gpus):
+                p = mp.Process(
+                    target=judge_worker,
+                    args=(gpu_id, judge_idx, num_gpus, 0,
+                          [str(f) for f in input_files], str(scores_dir),
+                          args.batch_size, is_strict)
+                )
+                p.start()
+                processes.append(p)
+            for p in processes:
+                p.join()
 
-        for p in processes:
-            p.join()
+    scoring_time = time.time() - t0
+    print()
+    print(f"  Scoring complete in {scoring_time/60:.1f} minutes.")
+    print(f"  Merging votes (>= {min_votes}/5 to survive)...")
+    print()
 
-        print()
-        print("  Merging worker outputs...")
-        merge_outputs(output_dir, num_workers, [str(f) for f in input_files], prefix="_worker")
+    # Merge votes
+    total_in, total_out = merge_votes(
+        [str(f) for f in input_files], str(scores_dir), str(output_dir), min_votes
+    )
 
     elapsed = time.time() - t0
+    pct = (total_out / max(1, total_in)) * 100
 
-    # Final summary
-    total_output = 0
     print()
-    print(f"  PHASE {args.phase}/4 COMPLETE — {elapsed/60:.1f} minutes")
-    print()
-    print("  Output files:")
-    for f in sorted(output_dir.glob("*.jsonl")):
-        n = sum(1 for _ in open(f, "r", encoding="utf-8"))
-        total_output += n
-        size_mb = f.stat().st_size / 1e6
-        print(f"    {f.name}: {n:,} docs ({size_mb:.0f} MB)")
-
-    pct = (total_output / max(1, total_input)) * 100
-    print(f"    TOTAL: {total_output:,} docs ({pct:.0f}% of input)")
+    print(f"  ╔══════════════════════════════════════════════════╗")
+    print(f"  ║  ROUND {args.round} COMPLETE — {elapsed/60:.1f} min                      ║")
+    print(f"  ║  {total_out:>12,} / {total_in:>12,} docs survived ({pct:.0f}%)    ║")
+    print(f"  ╚══════════════════════════════════════════════════╝")
     print()
 
-    if args.phase < 4:
-        print(f"  Next: python filter_data.py --phase {args.phase + 1}")
+    if args.round == 1:
+        print(f"  Next: python filter_data.py --round 2")
     else:
-        print("  ALL 4 PHASES COMPLETE — data/final/ is ready for training")
-        print("  Next: bash run.sh train")
+        print(f"  FILTERING COMPLETE — data/final/ is ready for training")
+        print(f"  Next: bash run.sh train")
     print()
+
+    # Cleanup scores
+    import shutil
+    if scores_dir.exists():
+        shutil.rmtree(scores_dir)
 
 
 if __name__ == "__main__":
