@@ -205,7 +205,7 @@ def train_5090(
     print("TRYPLICITY TRAINING — RTX 5090 (32 GB)")
     print(f"Budget: ${budget_dollars:.2f} at ${rate_per_hour:.2f}/hr = {pretrain_minutes:.0f} min pretrain")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"Token target: {config.training.total_tokens_target / 1e6:.0f}M")
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
@@ -312,7 +312,7 @@ def train_5090(
     # Memory check after optimizer
     allocated = torch.cuda.memory_allocated(device) / 1e9
     print(f"\n  GPU memory (model + optimizer): {allocated:.2f} GB")
-    print(f"  Headroom: {torch.cuda.get_device_properties(0).total_mem / 1e9 - allocated:.2f} GB")
+    print(f"  Headroom: {torch.cuda.get_device_properties(0).total_memory / 1e9 - allocated:.2f} GB")
 
     # ---- Estimate total steps ----
     estimated_total_steps = max(1, int(config.training.total_tokens_target / effective_batch_tokens))
