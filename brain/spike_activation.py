@@ -55,8 +55,8 @@ class SpikeActivation(nn.Module):
         # Step 4: Update firing rate EMA (for monitoring, no grad needed)
         if self.training:
             with torch.no_grad():
-                batch_firing_rate = mask.float().mean(dim=tuple(range(mask.ndim - 1)))
-                self.firing_rate_ema.lerp_(batch_firing_rate.float(), self.ema_alpha)
+                batch_firing_rate = mask.mean(dim=tuple(range(mask.ndim - 1)))
+                self.firing_rate_ema.lerp_(batch_firing_rate.to(self.firing_rate_ema.dtype), self.ema_alpha)
 
         return sparse_output
 

@@ -132,7 +132,7 @@ class DynamicSparsityRouter(nn.Module):
         # Update EMA stats
         if self.training:
             with torch.no_grad():
-                self.avg_k_ema.lerp_(avg_k.detach().float(), 0.01)
+                self.avg_k_ema.lerp_(avg_k.detach().to(self.avg_k_ema.dtype), 0.01)
 
         stats = {
             "avg_active_experts": avg_k.item(),
@@ -242,7 +242,7 @@ class LateralInhibitionRouter(DynamicSparsityRouter):
         if self.training:
             with torch.no_grad():
                 self.steps_since_update += 1
-                self.avg_k_ema.lerp_(avg_k.detach().float(), 0.01)
+                self.avg_k_ema.lerp_(avg_k.detach().to(self.avg_k_ema.dtype), 0.01)
 
         stats = {
             "avg_active_experts": avg_k.item(),
