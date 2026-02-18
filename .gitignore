@@ -1,0 +1,26 @@
+# Training data (download on the pod, not in git)
+data/*.jsonl
+data/*.json
+
+# Checkpoints
+checkpoints/
+
+# Tokenizer (rebuild on pod)
+tokenizer/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+*.log
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (for the web frontend)
+node_modules/

@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tryplicity</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #0e0e1a;
+      --surface: #161625;
+      --surface-hover: #1c1c30;
+      --border: #252540;
+      --border-light: #1f1f38;
+      --text: #ededf5;
+      --text-sec: #8e8ea8;
+      --text-mute: #555570;
+      --purple: #7c3aed;
+      --purple-hi: #8b5cf6;
+      --purple-lo: rgba(124,58,237,0.12);
+      --purple-lo2: rgba(124,58,237,0.06);
+      --purple-border: rgba(124,58,237,0.2);
+      --shadow: 0 8px 32px rgba(0,0,0,0.45);
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+      --ease-out: cubic-bezier(0, 0, 0.2, 1);
+      --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+      --r: 12px;
+      --r-lg: 16px;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Sidebar ── */
+    .side {
+      width: 260px;
+      min-width: 260px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+    }
+    .side-head {
+      padding: 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo { width: 32px; height: 32px; flex-shrink: 0; }
+    .logo .ring { transform-origin: 16px 16px; animation: logoSpin 8s linear infinite; }
+    .logo .core { animation: logoPulse 3s var(--ease) infinite; transform-origin: 16px 16px; }
+    @keyframes logoSpin { to { transform: rotate(360deg); } }
+    @keyframes logoPulse { 0%, 100% { r: 5.5; opacity: 1; } 50% { r: 4; opacity: 0.6; } }
+    .logo-text { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
+
+    .new-btn {
+      margin: 0 12px 16px;
+      padding: 10px 14px;
+      background: var(--purple);
+      border: none;
+      border-radius: var(--r);
+      color: #fff;
+      font: 600 13.5px/1 'Inter', sans-serif;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: background 0.2s var(--ease), box-shadow 0.2s var(--ease), transform 0.2s var(--ease);
+    }
+    .new-btn:hover { background: var(--purple-hi); box-shadow: 0 4px 20px rgba(124,58,237,0.3); transform: translateY(-1px); }
+    .new-btn:active { transform: translateY(0) scale(0.98); }
+    .new-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+
+    .side-label {
+      padding: 8px 20px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-mute);
+    }
+
+    .threads { flex: 1; overflow-y: auto; padding: 0 8px; }
+    .threads::-webkit-scrollbar { width: 4px; }
+    .threads::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .th {
+      padding: 10px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--text-sec);
+      transition: background 0.18s var(--ease), color 0.18s var(--ease);
+      margin-bottom: 1px;
+    }
+    .th:hover { background: var(--purple-lo2); color: var(--text); }
+    .th.on { background: var(--purple-lo); color: var(--purple-hi); font-weight: 500; }
+    .th svg { width: 18px; height: 18px; flex-shrink: 0; opacity: 0.4; transition: opacity 0.18s var(--ease); }
+    .th.on svg { opacity: 1; }
+    .th span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .th button {
+      opacity: 0; background: none; border: none; color: var(--text-mute);
+      cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px;
+      transition: opacity 0.15s, color 0.15s;
+    }
+    .th:hover button { opacity: 0.6; }
+    .th button:hover { opacity: 1; color: #f87171; }
+
+    .side-foot {
+      padding: 14px 16px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-mute);
+      text-align: center;
+    }
+
+    /* ── Main ── */
+    .main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; background: var(--bg); }
+
+    /* ── Topbar ── */
+    .top {
+      height: 52px;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .top-l { display: flex; align-items: center; gap: 10px; }
+
+    /* ── Model dropdown ── */
+    .msel { position: relative; }
+    .msel-btn {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 12px; border-radius: 10px;
+      background: var(--purple-lo2); border: 1px solid var(--purple-border);
+      cursor: pointer; font: 500 13px/1 'Inter', sans-serif; color: var(--text-sec);
+      transition: all 0.2s var(--ease);
+    }
+    .msel-btn:hover { background: var(--purple-lo); border-color: var(--purple); color: var(--text); }
+    .msel-btn .lbl { font-size: 11px; color: var(--text-mute); margin-right: 2px; }
+    .msel-btn .val { color: var(--text); font-weight: 600; }
+    .msel-btn .arr { width: 16px; height: 16px; opacity: 0.5; transition: transform 0.3s var(--ease-spring); }
+    .msel.open .arr { transform: rotate(180deg); }
+
+    .mdd {
+      position: absolute; top: calc(100% + 8px); left: 0;
+      width: 320px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r); box-shadow: var(--shadow);
+      z-index: 50; padding: 6px 0;
+      opacity: 0; visibility: hidden;
+      transform: translateY(-8px) scale(0.97);
+      transition: opacity 0.25s var(--ease), transform 0.25s var(--ease-spring), visibility 0.25s;
+    }
+    .msel.open .mdd { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
+    .mdd-label {
+      padding: 8px 14px 4px; font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-mute);
+    }
+    .mopt {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 14px; cursor: pointer;
+      transition: background 0.15s var(--ease);
+    }
+    .mopt:hover { background: var(--purple-lo2); }
+    .mopt.on { background: var(--purple-lo); }
+    .mopt .mi {
+      width: 34px; height: 34px; border-radius: 9px;
+      background: var(--purple-lo); display: flex;
+      align-items: center; justify-content: center; flex-shrink: 0;
+      transition: background 0.2s var(--ease);
+    }
+    .mopt.on .mi { background: var(--purple); }
+    .mopt .mi svg { width: 18px; height: 18px; }
+    .mopt .mx { flex: 1; min-width: 0; }
+    .mopt .mn { font-size: 13px; font-weight: 600; color: var(--text); }
+    .mopt .md { font-size: 11px; color: var(--text-mute); margin-top: 1px; }
+    .mopt .mb {
+      font-size: 10px; font-weight: 600; padding: 3px 8px; border-radius: 6px;
+      background: var(--purple-lo); color: var(--purple-hi); flex-shrink: 0;
+      white-space: nowrap;
+    }
+    .mopt .mc {
+      width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--border);
+      flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+      transition: all 0.2s var(--ease-spring);
+    }
+    .mopt.on .mc { background: var(--purple); border-color: var(--purple); transform: scale(1.1); }
+    .mopt.on .mc::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #fff; }
+
+    .top-r button {
+      background: var(--surface); border: 1px solid var(--border); color: var(--text-sec);
+      padding: 6px 14px; border-radius: 8px; font: 500 12px/1 'Inter', sans-serif;
+      cursor: pointer; transition: all 0.18s var(--ease);
+    }
+    .top-r button:hover { background: var(--purple-lo2); color: var(--text); border-color: var(--purple-border); }
+    .top-r button:active { transform: scale(0.97); }
+
+    /* ── Chat ── */
+    .scroll { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
+    .scroll::-webkit-scrollbar { width: 6px; }
+    .scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+    .inner { max-width: 720px; margin: 0 auto; padding: 40px 24px 160px; }
+
+    /* ── Welcome ── */
+    .wel { display: flex; flex-direction: column; align-items: center; padding: 80px 20px 20px; text-align: center; }
+    .wel-logo { width: 72px; height: 72px; margin-bottom: 28px; }
+    .wel-logo .w-ring { transform-origin: 36px 36px; animation: logoSpin 10s linear infinite; }
+    .wel-logo .w-core { animation: welPulse 3s var(--ease) infinite; transform-origin: 36px 36px; }
+    @keyframes welPulse { 0%, 100% { r: 12.5; opacity: 1; } 50% { r: 10; opacity: 0.65; } }
+    .wel h1 { font-size: 32px; font-weight: 700; letter-spacing: -0.8px; margin-bottom: 10px; }
+    .wel p { color: var(--text-sec); font-size: 15px; line-height: 1.6; max-width: 420px; }
+
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 40px; max-width: 520px; width: 100%; }
+    .card {
+      padding: 14px 16px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r); cursor: pointer; text-align: left;
+      font-family: inherit; color: var(--text);
+      transition: border-color 0.25s var(--ease), background 0.25s var(--ease), box-shadow 0.25s var(--ease), transform 0.25s var(--ease);
+    }
+    .card:hover { border-color: var(--purple-border); background: var(--purple-lo2); box-shadow: 0 4px 20px rgba(0,0,0,0.3); transform: translateY(-2px); }
+    .card:active { transform: translateY(0) scale(0.98); }
+    .card .ct { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+    .card .cd { font-size: 12px; color: var(--text-mute); line-height: 1.4; }
+
+    /* ── Messages ── */
+    .msg { margin-bottom: 24px; animation: slideUp 0.35s var(--ease) both; }
+    @keyframes slideUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+
+    .msg-u { display: flex; justify-content: flex-end; }
+    .msg-u .bub {
+      background: var(--purple); color: #fff;
+      padding: 10px 16px; border-radius: 16px 16px 4px 16px;
+      max-width: 60%; font-size: 14px; line-height: 1.6; word-break: break-word;
+    }
+
+    .msg-a .ah { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .msg-a .av { width: 24px; height: 24px; flex-shrink: 0; }
+    .msg-a .av svg { width: 24px; height: 24px; }
+    .msg-a .av circle:first-child { animation: logoSpin 8s linear infinite; transform-origin: 12px 12px; }
+    .msg-a .an { font-size: 13px; font-weight: 600; }
+
+    .msg-a .ac {
+      padding: 16px 20px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r-lg); font-size: 14px; line-height: 1.75;
+    }
+    .msg-a .sr { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-light); display: flex; flex-wrap: wrap; gap: 6px; }
+    .sc {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 10px; background: var(--purple-lo2); border: 1px solid var(--purple-border);
+      border-radius: 6px; font-size: 11px; color: var(--purple-hi); font-weight: 500;
+      transition: background 0.15s var(--ease);
+    }
+    .sc:hover { background: var(--purple-lo); }
+    .sc .sn { font-size: 10px; font-weight: 700; opacity: 0.6; }
+
+    /* ── Typing ── */
+    .dots { display: flex; gap: 6px; padding: 16px 20px; align-items: center; }
+    .dots span {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--purple-hi);
+      animation: wave 1.4s var(--ease) infinite;
+    }
+    .dots span:nth-child(2) { animation-delay: 0.12s; }
+    .dots span:nth-child(3) { animation-delay: 0.24s; }
+    @keyframes wave {
+      0%, 50%, 100% { transform: translateY(0) scale(1); opacity: 0.25; }
+      25% { transform: translateY(-10px) scale(1.15); opacity: 1; }
+    }
+
+    /* ── Input ── */
+    .inp-area {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      padding: 20px 24px 24px;
+      background: linear-gradient(transparent, var(--bg) 40%);
+      z-index: 5;
+    }
+    .inp-box { max-width: 720px; margin: 0 auto; position: relative; }
+    .inp-box textarea {
+      width: 100%; padding: 14px 52px 14px 18px;
+      background: var(--surface); border: 1.5px solid var(--border);
+      border-radius: var(--r-lg); color: var(--text);
+      font: 14.5px/1.5 'Inter', sans-serif;
+      resize: none; outline: none; max-height: 140px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+      transition: border-color 0.25s var(--ease), box-shadow 0.25s var(--ease);
+    }
+    .inp-box textarea::placeholder { color: var(--text-mute); }
+    .inp-box textarea:focus {
+      border-color: var(--purple);
+      box-shadow: 0 4px 24px rgba(0,0,0,0.4), 0 0 0 3px rgba(124,58,237,0.12);
+    }
+
+    .go {
+      position: absolute; right: 8px; bottom: 8px;
+      width: 36px; height: 36px; border-radius: 10px;
+      background: var(--border-light); border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.2s var(--ease-spring);
+    }
+    .go svg { width: 16px; height: 16px; transition: stroke 0.15s; }
+    .go.on { background: var(--purple); }
+    .go.on svg { stroke: #fff; }
+    .go.on:hover { background: var(--purple-hi); box-shadow: 0 4px 16px rgba(124,58,237,0.35); transform: scale(1.08); }
+    .go.on:active { transform: scale(0.95); }
+
+    .disc { text-align: center; margin-top: 8px; font-size: 11px; color: var(--text-mute); }
+
+    @media (max-width: 768px) {
+      .side { display: none; }
+      .cards { grid-template-columns: 1fr; }
+      .inner { padding: 24px 16px 150px; }
+    }
+  </style>
+</head>
+<body>
+
+<aside class="side">
+  <div class="side-head">
+    <div class="logo">
+      <svg viewBox="0 0 32 32" fill="none">
+        <circle class="ring" cx="16" cy="16" r="14" fill="none" stroke="#8b5cf6" stroke-width="2.5" stroke-dasharray="5.9 3"/>
+        <circle class="core" cx="16" cy="16" r="5.5" fill="#8b5cf6"/>
+      </svg>
+    </div>
+    <span class="logo-text">Tryplicity</span>
+  </div>
+  <button class="new-btn" onclick="newConvo()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    New Thread
+  </button>
+  <div class="side-label">Recent</div>
+  <div class="threads" id="tl"></div>
+  <div class="side-foot">Tryplicity v1.0</div>
+</aside>
+
+<main class="main">
+  <div class="top">
+    <div class="top-l">
+      <div class="msel" id="msel">
+        <button class="msel-btn" onclick="togDrop()">
+          <span class="lbl">Model:</span>
+          <span class="val" id="mname">No model</span>
+          <svg class="arr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div class="mdd">
+          <div class="mdd-label">Available Models</div>
+          <div class="mopt" onclick="pickModel(this,'Tryplicity Pro')">
+            <div class="mi"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8" fill="none" stroke="#8b5cf6" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="#8b5cf6"/></svg></div>
+            <div class="mx">
+              <div class="mn">Tryplicity Pro</div>
+              <div class="md">Advanced AI search &amp; reasoning</div>
+            </div>
+            <span class="mb">Coming Soon</span>
+            <div class="mc"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="top-r">
+      <button onclick="clearChat()">Clear chat</button>
+    </div>
+  </div>
+
+  <div class="scroll" id="scr">
+    <div class="inner" id="ci"></div>
+  </div>
+
+  <div class="inp-area">
+    <div class="inp-box">
+      <textarea id="inp" rows="1" placeholder="Ask anything..." oninput="grow(this);togGo()" onkeydown="onKey(event)"></textarea>
+      <button class="go" id="go" onclick="send()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#555570" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      </button>
+    </div>
+    <div class="disc">Tryplicity can make mistakes. Verify important information.</div>
+  </div>
+</main>
+
+<script>
+const LOGO = `<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="4.2 2.1"/><circle cx="12" cy="12" r="4" fill="#8b5cf6"/></svg>`;
+
+let convos = JSON.parse(localStorage.getItem('tri_c') || '{}');
+let cur = null;
+let busy = false;
+
+(function init() {
+  renderSide();
+  const last = localStorage.getItem('tri_l');
+  (last && convos[last]) ? load(last) : newConvo();
+})();
+
+function newConvo() {
+  const id = 'c' + Date.now().toString(36);
+  convos[id] = { id, title: 'New Thread', msgs: [], ts: Date.now() };
+  cur = id;
+  save();
+  renderSide();
+  renderChat();
+  document.getElementById('inp').focus();
+}
+
+function load(id) {
+  cur = id;
+  localStorage.setItem('tri_l', id);
+  renderSide();
+  renderChat();
+}
+
+function del(id, e) {
+  e.stopPropagation();
+  delete convos[id];
+  save();
+  if (cur === id) {
+    const ids = Object.keys(convos);
+    ids.length ? load(ids[0]) : newConvo();
+  } else renderSide();
+}
+
+function clearChat() {
+  if (!cur) return;
+  convos[cur].msgs = [];
+  convos[cur].title = 'New Thread';
+  save();
+  renderSide();
+  renderChat();
+}
+
+function save() {
+  localStorage.setItem('tri_c', JSON.stringify(convos));
+  localStorage.setItem('tri_l', cur);
+}
+
+function renderSide() {
+  const el = document.getElementById('tl');
+  const sorted = Object.values(convos).sort((a, b) => b.ts - a.ts);
+  el.innerHTML = sorted.map(c => `
+    <div class="th ${c.id === cur ? 'on' : ''}" onclick="load('${c.id}')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+      <span>${esc(c.title)}</span>
+      <button onclick="del('${c.id}',event)">&times;</button>
+    </div>`).join('');
+}
+
+function renderChat() {
+  const el = document.getElementById('ci');
+  const c = convos[cur];
+  if (!c || !c.msgs.length) { el.innerHTML = welHTML(); return; }
+  el.innerHTML = c.msgs.map((m, i) => {
+    if (m.role === 'user') {
+      return `<div class="msg msg-u" style="animation-delay:${i * 0.04}s"><div class="bub">${esc(m.text)}</div></div>`;
+    }
+    let src = '';
+    if (m.sources && m.sources.length) {
+      src = `<div class="sr">${m.sources.map((s, j) =>
+        `<span class="sc"><span class="sn">${j + 1}</span>${esc(s)}</span>`).join('')}</div>`;
+    }
+    return `<div class="msg msg-a" style="animation-delay:${i * 0.04}s">
+      <div class="ah"><div class="av">${LOGO}</div><span class="an">Tryplicity</span></div>
+      <div class="ac">${esc(m.text)}${src}</div>
+    </div>`;
+  }).join('');
+  scrollEnd();
+}
+
+function welHTML() {
+  return `<div class="wel">
+    <div class="wel-logo">
+      <svg viewBox="0 0 72 72" fill="none">
+        <circle class="w-ring" cx="36" cy="36" r="32" fill="none" stroke="#8b5cf6" stroke-width="4" stroke-dasharray="13.4 6.7"/>
+        <circle class="w-core" cx="36" cy="36" r="12.5" fill="#8b5cf6"/>
+      </svg>
+    </div>
+    <h1>What would you like to know?</h1>
+    <p>Search, explore, and get sourced answers from Tryplicity.</p>
+    <div class="cards">
+      <button class="card" onclick="qAsk(this)"><div class="ct">Explain quantum computing</div><div class="cd">Break it down with simple examples</div></button>
+      <button class="card" onclick="qAsk(this)"><div class="ct">Latest AI breakthroughs</div><div class="cd">What's new in research this year</div></button>
+      <button class="card" onclick="qAsk(this)"><div class="ct">Best startup tech stack</div><div class="cd">Languages and tools for an MVP</div></button>
+      <button class="card" onclick="qAsk(this)"><div class="ct">How do rockets land?</div><div class="cd">The engineering behind SpaceX</div></button>
+    </div>
+  </div>`;
+}
+
+function typHTML() {
+  return `<div class="ah"><div class="av">${LOGO}</div><span class="an">Tryplicity</span></div>
+  <div class="ac"><div class="dots"><span></span><span></span><span></span></div></div>`;
+}
+
+async function send() {
+  const inp = document.getElementById('inp');
+  const text = inp.value.trim();
+  if (!text || busy) return;
+  busy = true;
+
+  const c = convos[cur];
+  if (!c.msgs.length) {
+    c.title = text.length > 36 ? text.slice(0, 36) + '...' : text;
+    renderSide();
+  }
+
+  c.msgs.push({ role: 'user', text, ts: Date.now() });
+  save();
+  renderChat();
+
+  inp.value = '';
+  grow(inp);
+  togGo();
+
+  const el = document.getElementById('ci');
+  const tip = document.createElement('div');
+  tip.className = 'msg msg-a';
+  tip.innerHTML = typHTML();
+  el.appendChild(tip);
+  scrollEnd();
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text })
+    });
+    const data = await res.json();
+    c.msgs.push({ role: 'ai', text: data.text, sources: data.sources, ts: Date.now() });
+  } catch {
+    c.msgs.push({ role: 'ai', text: 'Something went wrong. Please try again.', sources: [], ts: Date.now() });
+  }
+
+  save();
+  busy = false;
+  renderChat();
+}
+
+function qAsk(btn) {
+  document.getElementById('inp').value = btn.querySelector('.ct').textContent;
+  send();
+}
+
+function togDrop() { document.getElementById('msel').classList.toggle('open'); }
+function pickModel(el, name) {
+  const dd = document.getElementById('msel');
+  dd.querySelectorAll('.mopt').forEach(o => o.classList.remove('on'));
+  el.classList.add('on');
+  document.getElementById('mname').textContent = name;
+  dd.classList.remove('open');
+}
+
+document.addEventListener('click', e => {
+  const dd = document.getElementById('msel');
+  if (!dd.contains(e.target)) dd.classList.remove('open');
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.getElementById('msel').classList.remove('open');
+});
+
+function grow(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 140) + 'px'; }
+function togGo() { document.getElementById('go').classList.toggle('on', document.getElementById('inp').value.trim().length > 0); }
+function onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }
+function scrollEnd() { const s = document.getElementById('scr'); requestAnimationFrame(() => s.scrollTop = s.scrollHeight); }
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+</script>
+</body>
+</html>
