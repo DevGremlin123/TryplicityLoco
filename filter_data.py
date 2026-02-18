@@ -1,18 +1,17 @@
 """
-Tryplicity Data Filter — Two-phase quality + article relevance filter.
+Tryplicity Data Filter — 4-phase deep cleaning pipeline.
 
-Phase 1: Quality filter using pre-trained FineWeb-Edu classifier.
-          Scores each document 0-5 for educational quality. Keeps >= 3.
-          Distributes across all available GPUs via multiprocessing.
+Phase 1: Quality classifier (FineWeb-Edu, threshold >= 3.0)    GPU
+Phase 2: Quality classifier (stricter, threshold >= 3.5)       GPU
+Phase 3: Article heuristics (standard rules)                   CPU
+Phase 4: Article heuristics (strict rules — only the best)     CPU
 
-Phase 2: Article relevance filter using heuristic rules.
-          Keeps only well-structured article-like prose.
-          Runs on CPU, parallelized across processes for I/O speed.
+Data flow:
+  data/*.jsonl → data/phase1/ → data/phase2/ → data/phase3/ → data/final/
 
 Usage:
-  python filter_data.py --phase 1                  # Quality filter
-  python filter_data.py --phase 2                  # Article relevance filter
-  python filter_data.py --phase 1 --threshold 2.5  # Lower quality bar
+  python filter_data.py --phase 1    # or 2, 3, 4
+  bash run.sh filter                 # runs all 4 phases
 """
 
 import argparse, json, os, re, time, sys
@@ -20,70 +19,113 @@ from pathlib import Path
 import multiprocessing as mp
 
 
-# ── Phase 2 heuristics ───────────────────────────────────────────
+# ── Article heuristics ───────────────────────────────────────────
 
-def is_article_quality(text):
+def is_article_quality(text, strict=False):
     """
     Check if text has the structure of a well-written article.
-    Returns True if it passes all heuristic checks.
-    Tuned for Opus 4.6 writing style: clear prose, good structure,
-    no excessive code/lists, readable but not dumbed down.
+    strict=False: standard pass (Phase 3)
+    strict=True:  tight pass (Phase 4) — only the purest prose survives
     """
-    if len(text) < 500:
+    # --- Thresholds ---
+    if strict:
+        min_chars = 800
+        min_paragraphs = 4
+        min_para_words, max_para_words = 50, 400
+        min_sent_words, max_sent_words = 12, 28
+        max_code_ratio = 0.03
+        max_list_ratio = 0.15
+        min_sentences = 8
+        min_punct = 8
+        max_repeats = 2
+    else:
+        min_chars = 500
+        min_paragraphs = 3
+        min_para_words, max_para_words = 30, 600
+        min_sent_words, max_sent_words = 10, 35
+        max_code_ratio = 0.05
+        max_list_ratio = 0.25
+        min_sentences = 5
+        min_punct = 5
+        max_repeats = 3
+
+    if len(text) < min_chars:
         return False
 
     # Split into paragraphs
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    if len(paragraphs) < 3:
+    if len(paragraphs) < min_paragraphs:
         return False
 
     # Check paragraph lengths (words)
     para_word_counts = [len(p.split()) for p in paragraphs]
     avg_para_words = sum(para_word_counts) / len(para_word_counts)
-    if avg_para_words < 30 or avg_para_words > 600:
+    if avg_para_words < min_para_words or avg_para_words > max_para_words:
         return False
 
     # Sentence analysis
     sentences = re.split(r'[.!?]+', text)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-    if len(sentences) < 5:
+    if len(sentences) < min_sentences:
         return False
 
     avg_sent_words = sum(len(s.split()) for s in sentences) / max(1, len(sentences))
-    if avg_sent_words < 10 or avg_sent_words > 35:
+    if avg_sent_words < min_sent_words or avg_sent_words > max_sent_words:
         return False
 
-    # Code/markup ratio — reject if too much code
+    # Code/markup ratio
     code_chars = sum(c in '{}[]()<>|\\/@#$%^&*=+~`' for c in text)
-    if code_chars / len(text) > 0.05:
+    if code_chars / len(text) > max_code_ratio:
         return False
 
-    # Bullet/list ratio — reject if mostly lists
+    # Bullet/list ratio
     list_lines = sum(1 for line in text.split('\n')
                      if line.strip().startswith(('-', '*', '•', '1.', '2.', '3.')))
     total_lines = max(1, len(text.split('\n')))
-    if list_lines / total_lines > 0.25:
+    if list_lines / total_lines > max_list_ratio:
         return False
 
-    # Repetition check — reject if 3+ identical sentences
+    # Repetition check
     seen = {}
     for s in sentences:
         key = s.lower().strip()[:100]
         seen[key] = seen.get(key, 0) + 1
-        if seen[key] >= 3:
+        if seen[key] >= max_repeats:
             return False
 
-    # Must have some sentence-ending punctuation (proper prose)
+    # Must have sentence-ending punctuation (proper prose)
     punct_count = text.count('.') + text.count('!') + text.count('?')
-    if punct_count < 5:
+    if punct_count < min_punct:
         return False
+
+    # --- Strict-only checks ---
+    if strict:
+        # Vocabulary diversity: unique words / total words > 0.3
+        words = text.lower().split()
+        if len(words) > 50:
+            diversity = len(set(words)) / len(words)
+            if diversity < 0.30:
+                return False
+
+        # No excessive caps (SHOUTING)
+        caps_words = sum(1 for w in words if w.isupper() and len(w) > 2)
+        if caps_words / max(1, len(words)) > 0.05:
+            return False
+
+        # Paragraph length variance — good articles have varied paragraph sizes
+        if len(para_word_counts) >= 3:
+            mean_wc = sum(para_word_counts) / len(para_word_counts)
+            variance = sum((wc - mean_wc) ** 2 for wc in para_word_counts) / len(para_word_counts)
+            # If all paragraphs are exactly the same length, it's likely template/generated
+            if variance < 10:
+                return False
 
     return True
 
 
-# ── Phase 1 worker (GPU) ────────────────────────────────────────
+# ── GPU worker (Phases 1 & 2) ───────────────────────────────────
 
-def phase1_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_size):
+def classifier_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_size):
     """Classify documents using FineWeb-Edu classifier on assigned GPU."""
     import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -96,7 +138,7 @@ def phase1_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_si
     model = AutoModelForSequenceClassification.from_pretrained(
         "HuggingFaceFW/fineweb-edu-classifier"
     ).to(device).eval()
-    print(f"  [GPU {gpu_id}] Classifier loaded. Processing...", flush=True)
+    print(f"  [GPU {gpu_id}] Ready. Threshold: {threshold}", flush=True)
 
     gpu_dir = Path(output_dir) / f"_gpu{gpu_id}"
     gpu_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +157,6 @@ def phase1_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_si
              open(out_file, "w", encoding="utf-8") as fout:
 
             for line_num, raw_line in enumerate(fin):
-                # Interleaved sharding: this GPU handles every Nth line
                 if line_num % num_gpus != gpu_id:
                     continue
 
@@ -125,7 +166,6 @@ def phase1_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_si
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-                # Truncate for classifier (first 2000 chars is enough to judge quality)
                 texts_batch.append(text[:2000])
                 lines_batch.append(raw_line)
 
@@ -138,7 +178,6 @@ def phase1_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_si
                     total_kept += kept
                     texts_batch, lines_batch = [], []
 
-            # Flush remaining
             if texts_batch:
                 kept = _classify_and_write(
                     model, tokenizer, texts_batch, lines_batch,
@@ -147,14 +186,15 @@ def phase1_worker(gpu_id, num_gpus, input_files, output_dir, threshold, batch_si
                 total_processed += len(texts_batch)
                 total_kept += kept
 
-        print(f"  [GPU {gpu_id}] {fname}: {total_kept:,} kept / {total_processed:,} processed", flush=True)
+        if total_processed > 0:
+            print(f"  [GPU {gpu_id}] {fname}: {total_kept:,} / {total_processed:,} kept", flush=True)
 
     pct = (total_kept / max(1, total_processed)) * 100
-    print(f"  [GPU {gpu_id}] DONE — {total_kept:,} / {total_processed:,} kept ({pct:.0f}%)", flush=True)
+    print(f"  [GPU {gpu_id}] DONE — {total_kept:,} / {total_processed:,} ({pct:.0f}%)", flush=True)
 
 
 def _classify_and_write(model, tokenizer, texts, lines, fout, device, threshold):
-    """Score a batch of texts with the classifier and write passing ones."""
+    """Score a batch of texts and write passing ones."""
     import torch
 
     kept = 0
@@ -171,7 +211,6 @@ def _classify_and_write(model, tokenizer, texts, lines, fout, device, threshold)
             logits = model(**inputs).logits
             scores = logits.squeeze(-1).float().cpu().tolist()
 
-        # Handle single-item batch (scores becomes a float instead of list)
         if isinstance(scores, float):
             scores = [scores]
 
@@ -180,7 +219,6 @@ def _classify_and_write(model, tokenizer, texts, lines, fout, device, threshold)
                 fout.write(line)
                 kept += 1
     except Exception as e:
-        # On error, keep all docs in batch (fail-safe, don't lose data)
         for line in lines:
             fout.write(line)
         kept = len(lines)
@@ -189,9 +227,9 @@ def _classify_and_write(model, tokenizer, texts, lines, fout, device, threshold)
     return kept
 
 
-# ── Phase 2 worker (CPU) ────────────────────────────────────────
+# ── CPU worker (Phases 3 & 4) ───────────────────────────────────
 
-def phase2_worker(worker_id, num_workers, input_files, output_dir):
+def heuristic_worker(worker_id, num_workers, input_files, output_dir, strict):
     """Filter documents using article-quality heuristics."""
     worker_dir = Path(output_dir) / f"_worker{worker_id}"
     worker_dir.mkdir(parents=True, exist_ok=True)
@@ -218,12 +256,12 @@ def phase2_worker(worker_id, num_workers, input_files, output_dir):
 
                 total_processed += 1
 
-                if is_article_quality(text):
+                if is_article_quality(text, strict=strict):
                     fout.write(raw_line)
                     total_kept += 1
 
     pct = (total_kept / max(1, total_processed)) * 100
-    print(f"  [Worker {worker_id}] DONE — {total_kept:,} / {total_processed:,} kept ({pct:.0f}%)", flush=True)
+    print(f"  [Worker {worker_id}] DONE — {total_kept:,} / {total_processed:,} ({pct:.0f}%)", flush=True)
 
 
 # ── Merge outputs ────────────────────────────────────────────────
@@ -256,38 +294,67 @@ def merge_outputs(output_dir, num_workers, input_files, prefix="_gpu"):
             shutil.rmtree(temp_dir)
 
 
+# ── Phase configs ────────────────────────────────────────────────
+
+PHASES = {
+    1: {
+        "name": "QUALITY FILTER (broad)",
+        "type": "classifier",
+        "threshold": 3.0,
+        "input_dir": "data",
+        "output_dir": "data/phase1",
+    },
+    2: {
+        "name": "QUALITY FILTER (strict)",
+        "type": "classifier",
+        "threshold": 3.5,
+        "input_dir": "data/phase1",
+        "output_dir": "data/phase2",
+    },
+    3: {
+        "name": "ARTICLE HEURISTICS (standard)",
+        "type": "heuristic",
+        "strict": False,
+        "input_dir": "data/phase2",
+        "output_dir": "data/phase3",
+    },
+    4: {
+        "name": "ARTICLE HEURISTICS (strict — only the best)",
+        "type": "heuristic",
+        "strict": True,
+        "input_dir": "data/phase3",
+        "output_dir": "data/final",
+    },
+}
+
+
 # ── Main ─────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Tryplicity Data Filter")
-    parser.add_argument("--phase", type=int, choices=[1, 2], required=True,
-                        help="1 = quality filter (GPU), 2 = article relevance (CPU)")
-    parser.add_argument("--data-dir", type=str, default="./data",
-                        help="Input data directory")
+    parser = argparse.ArgumentParser(description="Tryplicity 4-Phase Data Filter")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4], required=True,
+                        help="1-2 = quality classifier (GPU), 3-4 = article heuristics (CPU)")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Override input directory")
     parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output directory (default: data/filtered or data/final)")
-    parser.add_argument("--threshold", type=float, default=3.0,
-                        help="Phase 1: minimum quality score 0-5 (default: 3.0)")
+                        help="Override output directory")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Phases 1-2: override quality score threshold")
     parser.add_argument("--batch-size", type=int, default=512,
-                        help="Phase 1: batch size per GPU (default: 512)")
+                        help="Phases 1-2: batch size per GPU (default: 512)")
     parser.add_argument("--workers", type=int, default=None,
-                        help="Phase 2: number of CPU workers (default: auto)")
+                        help="Phases 3-4: number of CPU workers (default: auto)")
     args = parser.parse_args()
 
-    if args.phase == 1:
-        input_dir = Path(args.data_dir)
-        output_dir = Path(args.output_dir or "data/filtered")
-    else:
-        input_dir = Path(args.output_dir or "data/filtered")
-        if args.output_dir:
-            input_dir = Path(args.data_dir)
-        else:
-            input_dir = Path("data/filtered")
-        output_dir = Path("data/final")
+    cfg = PHASES[args.phase]
+    input_dir = Path(args.data_dir or cfg["input_dir"])
+    output_dir = Path(args.output_dir or cfg["output_dir"])
 
     input_files = sorted(input_dir.glob("*.jsonl"))
     if not input_files:
         print(f"  ERROR: No .jsonl files in {input_dir}")
+        if args.phase > 1:
+            print(f"  Run phase {args.phase - 1} first.")
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -295,7 +362,7 @@ def main():
     # Count input docs
     total_input = 0
     print()
-    print(f"  PHASE {args.phase}: {'QUALITY FILTER' if args.phase == 1 else 'ARTICLE RELEVANCE FILTER'}")
+    print(f"  PHASE {args.phase}/4: {cfg['name']}")
     print(f"  Input:  {input_dir} ({len(input_files)} files)")
     print(f"  Output: {output_dir}")
     print()
@@ -309,8 +376,9 @@ def main():
 
     t0 = time.time()
 
-    if args.phase == 1:
-        # Phase 1: GPU-based quality classification
+    if cfg["type"] == "classifier":
+        threshold = args.threshold if args.threshold is not None else cfg["threshold"]
+
         try:
             import torch
             num_gpus = torch.cuda.device_count()
@@ -319,18 +387,18 @@ def main():
             sys.exit(1)
 
         if num_gpus == 0:
-            print("  ERROR: No CUDA GPUs found. Phase 1 requires GPU.")
+            print("  ERROR: No CUDA GPUs found. Phases 1-2 require GPU.")
             sys.exit(1)
 
-        print(f"  Using {num_gpus} GPUs | Batch size: {args.batch_size} | Threshold: {args.threshold}")
+        print(f"  {num_gpus} GPUs | Batch: {args.batch_size} | Threshold: {threshold}")
         print()
 
         processes = []
         for gpu_id in range(num_gpus):
             p = mp.Process(
-                target=phase1_worker,
+                target=classifier_worker,
                 args=(gpu_id, num_gpus, [str(f) for f in input_files],
-                      str(output_dir), args.threshold, args.batch_size)
+                      str(output_dir), threshold, args.batch_size)
             )
             p.start()
             processes.append(p)
@@ -343,17 +411,17 @@ def main():
         merge_outputs(output_dir, num_gpus, [str(f) for f in input_files], prefix="_gpu")
 
     else:
-        # Phase 2: CPU-based heuristic filtering
+        strict = cfg["strict"]
         num_workers = args.workers or min(mp.cpu_count(), 16)
-        print(f"  Using {num_workers} CPU workers")
+        print(f"  {num_workers} CPU workers | Mode: {'STRICT' if strict else 'standard'}")
         print()
 
         processes = []
         for wid in range(num_workers):
             p = mp.Process(
-                target=phase2_worker,
+                target=heuristic_worker,
                 args=(wid, num_workers, [str(f) for f in input_files],
-                      str(output_dir))
+                      str(output_dir), strict)
             )
             p.start()
             processes.append(p)
@@ -370,7 +438,7 @@ def main():
     # Final summary
     total_output = 0
     print()
-    print(f"  PHASE {args.phase} COMPLETE — {elapsed/60:.1f} minutes")
+    print(f"  PHASE {args.phase}/4 COMPLETE — {elapsed/60:.1f} minutes")
     print()
     print("  Output files:")
     for f in sorted(output_dir.glob("*.jsonl")):
@@ -383,9 +451,10 @@ def main():
     print(f"    TOTAL: {total_output:,} docs ({pct:.0f}% of input)")
     print()
 
-    if args.phase == 1:
-        print("  Next: python filter_data.py --phase 2")
+    if args.phase < 4:
+        print(f"  Next: python filter_data.py --phase {args.phase + 1}")
     else:
+        print("  ALL 4 PHASES COMPLETE — data/final/ is ready for training")
         print("  Next: bash run.sh train")
     print()
 

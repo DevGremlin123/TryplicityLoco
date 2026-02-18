@@ -2,14 +2,20 @@
 # ============================================================
 # TRYPLICITY — UNIVERSAL LAUNCHER
 #
-# Data pipeline (can run anywhere):
+# Data pipeline:
 #   bash run.sh collect     <- Download ~200GB article data
-#   bash run.sh filter      <- Phase 1 (quality) + Phase 2 (article relevance)
-#   bash run.sh tokenizer   <- Build tokenizer from filtered data
+#   bash run.sh filter      <- 4-phase deep clean (GPU + CPU)
+#   bash run.sh tokenizer   <- Build tokenizer from clean data
 #
 # Training (5x B200):
 #   bash run.sh train       <- Train model (~23 hrs on 5x B200)
 #   bash run.sh all         <- filter + tokenizer + train
+#
+# Filter phases:
+#   Phase 1: Quality classifier (threshold >= 3.0)
+#   Phase 2: Quality classifier (stricter, >= 3.5)
+#   Phase 3: Article heuristics (standard)
+#   Phase 4: Article heuristics (strict — only the best)
 #
 # ============================================================
 
@@ -30,7 +36,16 @@ run_collect() {
 
 run_filter() {
     echo ""
-    echo "  TRYPLICITY — FILTERING DATA (Phase 1 + Phase 2)"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║  TRYPLICITY — 4-PHASE DEEP CLEAN            ║"
+    echo "  ║                                              ║"
+    echo "  ║  Phase 1: Quality classifier (>= 3.0)  GPU  ║"
+    echo "  ║  Phase 2: Quality classifier (>= 3.5)  GPU  ║"
+    echo "  ║  Phase 3: Article heuristics (standard) CPU  ║"
+    echo "  ║  Phase 4: Article heuristics (strict)   CPU  ║"
+    echo "  ║                                              ║"
+    echo "  ║  Only the purest data survives.              ║"
+    echo "  ╚══════════════════════════════════════════════╝"
     echo ""
 
     pip install -q torch transformers 2>/dev/null || true
@@ -41,32 +56,63 @@ run_filter() {
         exit 1
     fi
 
-    # Phase 1: Quality filter (GPU)
-    if [ ! -d "data/filtered" ] || [ -z "$(ls data/filtered/*.jsonl 2>/dev/null)" ]; then
-        echo "  ── Phase 1: Quality Filter (FineWeb-Edu classifier) ──"
-        python filter_data.py --phase 1 --data-dir ./data --threshold 3.0 --batch-size 512
+    # Phase 1: Quality classifier (broad)
+    if [ ! -d "data/phase1" ] || [ -z "$(ls data/phase1/*.jsonl 2>/dev/null)" ]; then
+        echo "  ── PHASE 1/4: Quality Classifier (threshold >= 3.0) ──"
+        python filter_data.py --phase 1
     else
         echo "  Phase 1 already done:"
-        for f in data/filtered/*.jsonl; do
+        for f in data/phase1/*.jsonl; do
             [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
         done
     fi
-
     echo ""
 
-    # Phase 2: Article relevance (CPU heuristics)
-    if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
-        echo "  ── Phase 2: Article Relevance Filter (heuristics) ──"
+    # Phase 2: Quality classifier (strict)
+    if [ ! -d "data/phase2" ] || [ -z "$(ls data/phase2/*.jsonl 2>/dev/null)" ]; then
+        echo "  ── PHASE 2/4: Quality Classifier (threshold >= 3.5) ──"
         python filter_data.py --phase 2
     else
         echo "  Phase 2 already done:"
+        for f in data/phase2/*.jsonl; do
+            [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
+        done
+    fi
+    echo ""
+
+    # Phase 3: Article heuristics (standard)
+    if [ ! -d "data/phase3" ] || [ -z "$(ls data/phase3/*.jsonl 2>/dev/null)" ]; then
+        echo "  ── PHASE 3/4: Article Heuristics (standard) ──"
+        python filter_data.py --phase 3
+    else
+        echo "  Phase 3 already done:"
+        for f in data/phase3/*.jsonl; do
+            [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
+        done
+    fi
+    echo ""
+
+    # Phase 4: Article heuristics (strict — only the best)
+    if [ ! -d "data/final" ] || [ -z "$(ls data/final/*.jsonl 2>/dev/null)" ]; then
+        echo "  ── PHASE 4/4: Article Heuristics (STRICT — only the best) ──"
+        python filter_data.py --phase 4
+    else
+        echo "  Phase 4 already done:"
         for f in data/final/*.jsonl; do
             [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
         done
     fi
 
     echo ""
-    echo "  FILTERING COMPLETE"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║  4-PHASE FILTERING COMPLETE                  ║"
+    echo "  ║  Only the purest data remains in data/final/ ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo ""
+    echo "  Final data:"
+    for f in data/final/*.jsonl; do
+        [ -f "$f" ] && echo "    $(basename $f): $(wc -l < "$f") docs"
+    done
     echo ""
 }
 
@@ -142,8 +188,8 @@ case "$MODE" in
         echo ""
         echo "  Data pipeline:"
         echo "    bash run.sh collect     Download ~200GB article data"
-        echo "    bash run.sh filter      Phase 1 (quality) + Phase 2 (relevance)"
-        echo "    bash run.sh tokenizer   Build tokenizer from filtered data"
+        echo "    bash run.sh filter      4-phase deep clean"
+        echo "    bash run.sh tokenizer   Build tokenizer"
         echo ""
         echo "  Training (5x B200, \$21.20/hr):"
         echo "    bash run.sh train       Train model (~23 hrs)"
