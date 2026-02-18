@@ -106,7 +106,7 @@ class DynamicSparsityRouter(nn.Module):
         sorted_weights = F.softmax(masked_logits, dim=-1) * mask
 
         # Scatter back to original expert positions
-        routing_weights = torch.zeros_like(gate_logits)
+        routing_weights = torch.zeros_like(sorted_weights)
         routing_weights.scatter_(-1, sorted_idx, sorted_weights)
 
         # Step 4: Auxiliary losses
@@ -222,7 +222,7 @@ class LateralInhibitionRouter(DynamicSparsityRouter):
         masked_logits = sorted_logits * mask + (-1e9) * (1 - mask)
         sorted_weights = F.softmax(masked_logits, dim=-1) * mask
 
-        routing_weights = torch.zeros_like(gate_logits)
+        routing_weights = torch.zeros_like(sorted_weights)
         routing_weights.scatter_(-1, sorted_idx, sorted_weights)
 
         # Aux losses (same as parent)

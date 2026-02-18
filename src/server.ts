@@ -4,6 +4,10 @@ import path from 'path';
 const app = express();
 const PORT = 5000;
 
+// Model inference server URL (set via env or defaults to localhost)
+// Point this to your RunPod pod's inference server
+const MODEL_API = process.env.MODEL_API_URL || 'http://localhost:8080';
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
@@ -14,7 +18,7 @@ interface ChatResponse {
   timestamp: string;
 }
 
-const RESPONSES: { text: string; sources: string[] }[] = [
+const FALLBACK_RESPONSES: { text: string; sources: string[] }[] = [
   {
     text: "That's a fascinating question. Based on current research and available data, there are several key perspectives to consider. The consensus among experts suggests a nuanced approach is most effective, balancing both empirical evidence and practical application.",
     sources: ["arxiv.org/research-insights", "nature.com/perspectives", "scholar.google.com"]
@@ -57,27 +61,77 @@ const RESPONSES: { text: string; sources: string[] }[] = [
   }
 ];
 
-app.post('/api/chat', (req: Request, res: Response) => {
+async function queryModel(message: string): Promise<{ text: string; sources: string[] } | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    const res = await fetch(`${MODEL_API}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    return { text: data.text, sources: data.sources || [] };
+  } catch {
+    return null;
+  }
+}
+
+app.post('/api/chat', async (req: Request, res: Response) => {
   const { message } = req.body;
   if (!message || typeof message !== 'string') {
     res.status(400).json({ error: 'Message is required' });
     return;
   }
 
-  const pick = RESPONSES[Math.floor(Math.random() * RESPONSES.length)];
-  const delay = 400 + Math.random() * 600;
+  // Try the real model first
+  const modelResult = await queryModel(message);
 
-  setTimeout(() => {
-    const response: ChatResponse = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2),
-      text: pick.text,
-      sources: pick.sources,
-      timestamp: new Date().toISOString()
-    };
-    res.json(response);
-  }, delay);
+  let text: string;
+  let sources: string[];
+
+  if (modelResult) {
+    text = modelResult.text;
+    sources = modelResult.sources;
+  } else {
+    // Fallback to canned responses if model is unavailable
+    const pick = FALLBACK_RESPONSES[Math.floor(Math.random() * FALLBACK_RESPONSES.length)];
+    text = pick.text;
+    sources = pick.sources;
+  }
+
+  const response: ChatResponse = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+    text,
+    sources,
+    timestamp: new Date().toISOString()
+  };
+  res.json(response);
+});
+
+// Health check that also reports model status
+app.get('/api/status', async (_req: Request, res: Response) => {
+  let modelOnline = false;
+  try {
+    const check = await fetch(`${MODEL_API}/health`, { signal: AbortSignal.timeout(3000) });
+    modelOnline = check.ok;
+  } catch { /* model offline */ }
+
+  res.json({
+    status: 'ok',
+    model: modelOnline ? 'connected' : 'offline (using fallback)',
+    modelApi: MODEL_API,
+  });
 });
 
 app.listen(PORT, () => {
-  console.log(`\n  Tryplicity running → http://localhost:${PORT}\n`);
+  console.log(`\n  Tryplicity running → http://localhost:${PORT}`);
+  console.log(`  Model API → ${MODEL_API}`);
+  console.log(`  Set MODEL_API_URL env var to point to your RunPod inference server\n`);
 });
