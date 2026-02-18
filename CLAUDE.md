@@ -26,17 +26,11 @@ Tryplicity is a custom AI model AND search/chat interface. Two parts:
 - `brain/predictive_coding.py` — Predictive coding wrapper
 - `brain/sleep_consolidation.py` — Between-phase memory consolidation
 - `brain/curriculum.py` — NeuroCurriculum (infancy → childhood → adolescence → mastery)
-- `training/train_5090.py` — Single GPU training script for RTX 5090 (32 GB VRAM)
-- `training/train_mi300x.py` — Multi-GPU training script for 8x MI300X (DDP)
-- `training/train_b200.py` — Multi-GPU training script for 4x NVIDIA B200 (DDP)
-- `training/train_h200.py` — Multi-GPU training script for 8x H200 SXM (FSDP)
+- `training/train.py` — **Universal training script** (auto-detects single/DDP/FSDP)
 - `training/data_pipeline.py` — StreamingTextDataset
 - `training/build_tokenizer.py` — BPE tokenizer builder (32K vocab)
 - `training/config.py` — FullConfig, ModelConfig, BrainConfig, TrainingConfig
-- `run_5090.sh` — Launch script for 5090 training
-- `run_training.sh` — Launch script for multi-GPU training
-- `run_b200.sh` — Launch script for 4x B200 training
-- `run_h200.sh` — Launch script for 8x H200 SXM training (FSDP)
+- `run.sh` — **Universal launcher** (`bash run.sh prep`, `bash run.sh train`, `bash run.sh`)
 - `download_data_mi300x.py` — Downloads training data
 - `filter_data_quality.py` — 5-model AI quality filter ensemble
 
@@ -47,36 +41,30 @@ Tryplicity is a custom AI model AND search/chat interface. Two parts:
 - `F.linear()` requires matching dtypes between activations and weights
 - These fixes are universal — work for both bf16 models AND fp32+autocast
 
-## VRAM Budgets
-- **RTX 5090 (32 GB)**: Use `create_5090_model()`, batch=1, accumulation=64, gradient_checkpointing=ON
-- **4x B200 (192 GB each)**: DDP, `create_full_model()`, batch=4/GPU, accum=8, grad_ckpt=ON, ~175 GB/GPU
-- **8x MI300X (192 GB each)**: DDP, `create_full_model()`, batch=2/GPU, accum=8, grad_ckpt=ON, ~170 GB/GPU
-- **8x H200 SXM (141 GB each)**: FSDP FULL_SHARD (DDP won't fit! 150 GB > 141 GB), batch=4/GPU, accum=4, ~41 GB/GPU
+## VRAM Budgets (auto-detected by train.py)
+- **Single GPU <= 48 GB** (e.g. RTX 5090): `create_5090_model()`, batch=1-2, accum=32-64
+- **Multi-GPU >= 150 GB/GPU** (e.g. B200): DDP, `create_full_model()`, batch=4/GPU
+- **Multi-GPU < 150 GB/GPU** (e.g. H200 SXM): FSDP FULL_SHARD, `create_full_model()`, batch=4/GPU
 - Always set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce fragmentation
-- DDP: weights=4B/param, optimizer=8B/param, grads=4B/param → 150 GB base for 9.4B (needs 150+ GB/GPU)
-- FSDP: shards across GPUs → 18.8 GB base per GPU for 8 GPUs (fits in 141 GB H200)
 
-## FSDP Notes (H200)
-- Uses `transformer_auto_wrap_policy` wrapping each `TryplicityBlock` as a separate FSDP unit
-- Weight tying (embed <-> lm_head) preserved with `use_orig_params=True`
-- Predictive coding uses logit confidence instead of `raw_model.embed()` (can't access model.module with FSDP)
-- Checkpoint saving uses `FSDP.state_dict_type()` with `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)`
-- Generation test uses `FSDP.summon_full_params()` to temporarily gather all params
-- Gradient clipping: use `model.clip_grad_norm_()` (FSDP method), NOT `torch.nn.utils.clip_grad_norm_()`
+## Strategy Auto-Detection (train.py)
+- 1 GPU → single mode (no distributed)
+- Multi-GPU + >= 150 GB/GPU → DDP (each GPU holds full model)
+- Multi-GPU + < 150 GB/GPU → FSDP (shards across GPUs)
+- FSDP: `transformer_auto_wrap_policy` wrapping `TryplicityBlock`, gradient clipping via `model.clip_grad_norm_()`
+- DDP: `find_unused_parameters=False`, gradient clipping via `torch.nn.utils.clip_grad_norm_()`
 
 ## Training Pipeline
-1. Install deps (torch, tokenizers, datasets, sentencepiece)
-2. Download data (`download_data_mi300x.py`)
-3. Build tokenizer (`training/build_tokenizer.py`)
-4. Train (`training/train_5090.py` or `training/train_b200.py` or `training/train_h200.py` or `training/train_mi300x.py`)
-5. Download checkpoint before shutting down cloud pod!
+1. `bash run.sh prep` — Install deps, download data, AI quality filter, build tokenizer
+2. `bash run.sh train` — Auto-detects GPUs, picks single/DDP/FSDP, trains
+3. `bash run.sh` — Both back-to-back
+4. Download checkpoint before shutting down cloud pod!
+
+Env vars: `TRAIN_MINUTES=30 TRAIN_RATE=25.00 bash run.sh train`
 
 ## Current Status (Feb 2026)
-- 5090 script with medium model (~1B params) ready but UNTESTED
+- **Unified pipeline**: One `run.sh` + one `training/train.py` for ANY hardware
 - All dtype bugs fixed (4 separate dtype crashes resolved)
-- 4x B200 script ready (`train_b200.py` + `run_b200.sh`): DDP, batch=4/GPU, ~175 GB/GPU, ~$3.67 for 11 min
-- **8x H200 SXM script ready** (`train_h200.py` + `run_h200.sh`): FSDP, batch=4/GPU, ~41 GB/GPU, ~$5.26 for 11 min
-- 8x MI300X script ready (`train_mi300x.py` + `run_mi300x.sh`): DDP
 - 40 GB data pipeline + 5-model AI quality filter ready (`filter_data_quality.py`)
 - GitHub: https://github.com/DevGremlin123/TryplicityLoco
 

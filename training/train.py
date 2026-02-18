@@ -1,406 +1,272 @@
 """
-Tryplicity Training Script
-Integrates all brain-inspired modules with the core model.
-Supports both 10-minute test and full 12-hour training runs.
+Tryplicity Universal Training Script — Auto-detects hardware, picks best strategy.
+
+Single GPU (<= 48 GB):  Small model (~1B), no distributed
+Multi-GPU (>= 150 GB):  Full 9.4B, DDP (each GPU holds full model)
+Multi-GPU (< 150 GB):   Full 9.4B, FSDP (shards across GPUs)
+
+Launch:
+  Single GPU:  python training/train.py --minutes 30
+  Multi-GPU:   torchrun --nproc_per_node=N training/train.py --minutes 11
 """
 
-import sys
-import os
-import time
-import math
-import argparse
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import sys, os, time, math, argparse, torch, torch.nn.functional as F
+from torch.utils.data import DataLoader
 from pathlib import Path
-from datetime import datetime
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from model.architecture import TryplicityModel, create_tiny_model, create_full_model
-from training.data_pipeline import create_dataloader
+from model.architecture import create_full_model, create_5090_model, TryplicityBlock
+from training.data_pipeline import StreamingTextDataset
 from brain.curriculum import NeuroCurriculum
-from brain.predictive_coding import PredictiveCodingWrapper
 from brain.hebbian_loss import HebbianAuxLoss
-from brain.sleep_consolidation import SleepConsolidation
 from tokenizers import Tokenizer
 
 
-def get_lr(step: int, total_steps: int, peak_lr: float, min_lr: float,
-           warmup_ratio: float = 0.02, stable_ratio: float = 0.88):
-    """WSD (Warmup-Stable-Decay) learning rate schedule."""
-    warmup_steps = int(total_steps * warmup_ratio)
-    stable_steps = int(total_steps * stable_ratio)
-    decay_steps = total_steps - warmup_steps - stable_steps
-
-    if step < warmup_steps:
-        return peak_lr * (step / max(1, warmup_steps))
-    elif step < warmup_steps + stable_steps:
-        return peak_lr
+def detect_hardware():
+    if not torch.cuda.is_available(): raise RuntimeError("No CUDA GPUs")
+    n = torch.cuda.device_count()
+    name = torch.cuda.get_device_name(0)
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if n == 1:
+        return {"n": n, "name": name, "vram": vram, "total": vram,
+                "strategy": "single", "model": "small" if vram <= 48 else "full"}
+    elif vram >= 150:
+        return {"n": n, "name": name, "vram": vram, "total": vram*n, "strategy": "ddp", "model": "full"}
     else:
-        decay_step = step - warmup_steps - stable_steps
-        progress = decay_step / max(1, decay_steps)
-        return min_lr + 0.5 * (peak_lr - min_lr) * (1 + math.cos(math.pi * progress))
+        return {"n": n, "name": name, "vram": vram, "total": vram*n, "strategy": "fsdp", "model": "full"}
 
 
-def train(
-    mode: str = "test",  # "test" (10 min) or "full" (12 hours)
-    device: str = "cuda",
-    checkpoint_dir: str = "./checkpoints",
-    data_dir: str = "./data",
-    tokenizer_path: str = "./tokenizer/tryplicity.json",
-):
-    """Main training loop."""
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+def batch_cfg(hw):
+    v, n, s = hw["vram"], hw["n"], hw["strategy"]
+    if s == "single":
+        if v <= 32: return 1, 64, 2048
+        elif v <= 48: return 2, 32, 2048
+        else: return 4, 16, 4096
+    return 4, max(1, 32 // n), 4096
 
-    print("=" * 60)
-    print(f"TRYPLICITY TRAINING - {'10-MINUTE TEST' if mode == 'test' else '12-HOUR FULL'}")
-    print(f"Device: {device}")
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
 
-    # ---- Configuration based on mode ----
-    if mode == "test":
-        training_minutes = 10
-        max_seq_len = 256
-        batch_size = 8
-        peak_lr = 1e-3
-        min_lr = 1e-5
-        max_data_samples = 5000  # Small subset for speed
-        log_interval = 10
-        save_interval_steps = 500
-        accumulation_steps = 1
-        use_brain = True
-        print("\n[Config] Tiny model, 10-minute training, brain-optimized")
+def setup(s):
+    if s == "single": return 0, 1
+    import torch.distributed as dist
+    dist.init_process_group(backend="nccl")
+    lr = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(lr)
+    return lr, dist.get_world_size()
+
+def cleanup(s):
+    if s != "single":
+        import torch.distributed as dist
+        if dist.is_initialized(): dist.destroy_process_group()
+
+def main_rank(s):
+    if s == "single": return True
+    import torch.distributed as dist
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+def log(m, s="single"):
+    if main_rank(s): print(m, flush=True)
+
+def lr_sched(step, total, peak, mn, wu=0.03, st=0.82):
+    w = int(total * wu); s = int(total * st)
+    if step < w: return peak * (step / max(1, w))
+    elif step < w + s: return peak
     else:
-        training_minutes = 720  # 12 hours
-        max_seq_len = 4096
-        batch_size = 2
-        peak_lr = 3e-3
-        min_lr = 3e-5
-        max_data_samples = None  # Use all data
-        log_interval = 100
-        save_interval_steps = 2000
-        accumulation_steps = 8  # Effective batch = 16
-        use_brain = True
-        print("\n[Config] Full model, 12-hour training, brain-optimized")
+        p = (step - w - s) / max(1, total - w - s)
+        return mn + 0.5 * (peak - mn) * (1 + math.cos(math.pi * p))
 
-    # ---- Create model ----
-    print("\nCreating model...")
-    if mode == "test":
-        model = create_tiny_model()
-    else:
-        model = create_full_model()
 
-    model = model.to(device)
-    params = model.count_parameters()
-    print(f"  Total parameters: {params['total']:,}")
-    print(f"  Trainable: {params['trainable']:,}")
+def train(minutes=11.0, rate=0.0, data_dir="./data/filtered",
+          tok_path="./tokenizer/tryplicity.json", ckpt_dir="./checkpoints"):
 
-    # Check VRAM usage
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        allocated = torch.cuda.memory_allocated() / 1e9
-        print(f"  GPU memory (model loaded): {allocated:.2f} GB")
+    hw = detect_hardware()
+    s = hw["strategy"]
+    bpg, accum, seq = batch_cfg(hw)
+    lr0, world = setup(s)
+    dev = f"cuda:{lr0}"
+    V = 32000
+    eff = bpg * world * accum * seq
 
-    # ---- Create data loader ----
-    print("\nLoading data...")
-    # For test mode, use the small sample files
-    if mode == "test":
-        data_files_dir = data_dir
-    else:
-        data_files_dir = data_dir
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
-    dataloader = create_dataloader(
-        data_dir=data_files_dir,
-        tokenizer_path=tokenizer_path,
-        max_seq_len=max_seq_len,
-        batch_size=batch_size,
-        max_samples=max_data_samples,
-    )
-    print(f"  Batches per epoch: {len(dataloader)}")
+    log("=" * 70, s)
+    log(f"TRYPLICITY TRAINING", s)
+    log(f"  {world}x {hw['name']} ({hw['vram']:.0f} GB) | {hw['total']:.0f} GB total", s)
+    log(f"  Strategy: {s.upper()} | Model: {'9.4B' if hw['model']=='full' else '~1B'}", s)
+    log(f"  {eff:,} tokens/step | {minutes:.0f} min" + (f" | ~${(minutes/60)*rate:.2f}" if rate > 0 else ""), s)
+    log("=" * 70, s)
 
-    # ---- Brain modules ----
-    hebbian = None
-    predictive_coding = None
-    curriculum = None
+    torch.manual_seed(42); torch.cuda.manual_seed_all(42)
+    model = create_full_model() if hw["model"] == "full" else create_5090_model()
+    model.gradient_checkpointing = True
+    model = model.to(dev)
+    H, L = model.hidden_size, model.num_layers
 
-    if use_brain:
-        print("\nInitializing brain modules...")
-        hidden_size = 256 if mode == "test" else 2048
-        num_layers = 4 if mode == "test" else 32
+    if main_rank(s):
+        p = model.count_parameters()
+        log(f"  Params: {p['total']:,}", s)
 
-        # Hebbian auxiliary losses
-        hebbian = HebbianAuxLoss(
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            enabled=True,
-        ).to(device)
+    use_embed_pc = False
+    if s == "ddp":
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[lr0], find_unused_parameters=False)
+        use_embed_pc = True
+    elif s == "fsdp":
+        from torch.distributed.fsdp import (FullyShardedDataParallel as FSDP, ShardingStrategy,
+            MixedPrecision, FullStateDictConfig, StateDictType)
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from functools import partial
+        model = FSDP(model,
+            auto_wrap_policy=partial(transformer_auto_wrap_policy, transformer_layer_cls={TryplicityBlock}),
+            mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16),
+            sharding_strategy=ShardingStrategy.FULL_SHARD, device_id=lr0,
+            use_orig_params=True, sync_module_states=True)
 
-        # Predictive coding
-        predictive_coding = PredictiveCodingWrapper(
-            hidden_size=hidden_size,
-            enabled=True,
-        )
-        predictive_coding.to(device)
+    data_files = sorted(Path(data_dir).glob("*.jsonl"))
+    if not data_files:
+        log(f"ERROR: No .jsonl in {data_dir}. Run: bash run.sh prep", s); cleanup(s); return
+    log(f"  Data: {[f.name for f in data_files]}", s)
 
-        # Curriculum (scaled to training time)
-        curriculum = NeuroCurriculum(
-            total_hours=training_minutes / 60.0,
-            enabled=True,
-        )
+    ds = StreamingTextDataset([str(f) for f in data_files], tok_path, seq, 50000)
+    dl = DataLoader(ds, batch_size=bpg, num_workers=4, pin_memory=True)
 
-        # Sleep consolidation
-        sleep = SleepConsolidation(enabled=True, replay_samples=100 if mode == "test" else 10000)
+    heb = HebbianAuxLoss(hidden_size=H, num_layers=L, enabled=True).to(dev)
+    cur = NeuroCurriculum(total_hours=minutes / 60.0, enabled=True)
 
-        print("  Hebbian: ON")
-        print("  Predictive coding: ON")
-        print("  Curriculum: ON")
-        print("  Sleep consolidation: ON")
+    pc = None
+    if use_embed_pc:
+        from brain.predictive_coding import PredictiveCodingWrapper
+        pc = PredictiveCodingWrapper(hidden_size=H, enabled=True); pc.to(dev)
 
-    # ---- Optimizer ----
-    # Collect all trainable parameters
-    param_groups = [
-        {"params": model.parameters(), "lr": peak_lr},
-    ]
-    if predictive_coding and predictive_coding.enabled:
-        param_groups.append({
-            "params": predictive_coding.parameters(),
-            "lr": peak_lr * 0.1,  # Predictor learns slower
-        })
-    if hebbian:
-        param_groups.append({
-            "params": hebbian.parameters(),
-            "lr": peak_lr * 0.1,
-        })
+    pgs = [{"params": model.parameters(), "lr": 3e-3}, {"params": heb.parameters(), "lr": 3e-4}]
+    if pc: pgs.append({"params": pc.parameters(), "lr": 3e-4})
+    opt = torch.optim.AdamW(pgs, lr=3e-3, betas=(0.9, 0.95), weight_decay=0.1)
 
-    optimizer = torch.optim.AdamW(param_groups, lr=peak_lr, betas=(0.9, 0.95), weight_decay=0.1)
+    est = max(50, int((minutes * 60 * (200000 if s != "single" else 50000)) / eff))
 
-    # ---- Estimate total steps ----
-    steps_per_epoch = len(dataloader) // accumulation_steps
-    # For time-based training, estimate based on speed
-    # We'll use a generous estimate and stop based on time
-    estimated_total_steps = steps_per_epoch * 10  # Assume up to 10 epochs
-    print(f"\n  Steps per epoch: {steps_per_epoch}")
-    print(f"  Estimated total steps: {estimated_total_steps}")
-
-    # ---- Training loop ----
-    print(f"\n{'='*60}")
-    print("TRAINING STARTED")
-    print(f"{'='*60}\n")
-
-    if curriculum:
-        curriculum.start()
-
-    model.train()
-    start_time = time.time()
-    global_step = 0
-    total_tokens = 0
-    best_loss = float("inf")
-    running_loss = 0.0
-    running_lm_loss = 0.0
+    log(f"\nTRAINING STARTED\n", s); cur.start(); model.train()
+    t0 = time.time()
+    step, micro, tok, best = 0, 0, 0, float("inf")
+    rl, rlm = 0.0, 0.0
 
     try:
-        epoch = 0
         while True:
-            epoch += 1
-            for batch_idx, batch in enumerate(dataloader):
-                # Check time limit
-                elapsed_minutes = (time.time() - start_time) / 60.0
-                if elapsed_minutes >= training_minutes:
-                    print(f"\n  Time limit reached ({training_minutes} minutes)")
-                    raise StopIteration()
+            for batch in dl:
+                if (time.time() - t0) / 60 >= minutes: raise StopIteration()
+                ids = batch["input_ids"].to(dev, non_blocking=True)
+                lab = batch["labels"].to(dev, non_blocking=True)
 
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    r = model(ids, labels=lab)
+                    loss = r["loss"]
 
-                # Forward pass
-                result = model(input_ids, labels=labels)
-                loss = result["loss"]
+                    if use_embed_pc and pc:
+                        raw = model.module if s == "ddp" else model
+                        with torch.no_grad():
+                            e1, e2 = raw.embed(ids), raw.embed(lab)
+                        tw = pc.compute_token_weights(e1, e2)
+                        sl, tl = r["logits"][:, :-1].contiguous(), lab[:, 1:].contiguous()
+                        ptl = F.cross_entropy(sl.view(-1, V), tl.view(-1), reduction="none").view(sl.shape[0], -1)
+                        loss = (ptl * tw[:, 1:]).mean() + r["aux_loss"] + 0.1 * pc.compute_predictor_loss(e1, e2)
+                        if r.get("multi_token_loss") is not None: loss = loss + 0.5 * r["multi_token_loss"]
+                    else:
+                        with torch.no_grad():
+                            sp = r["logits"][:, :-1].contiguous()
+                            tp = lab[:, 1:].contiguous()
+                            pr = F.softmax(sp.float(), dim=-1)
+                            tw = 0.5 + (1.0 - pr.gather(-1, tp.unsqueeze(-1)).squeeze(-1).clamp(0, 1))
+                            tw = tw / tw.mean().clamp(min=1e-8)
+                        sl, tl = r["logits"][:, :-1].contiguous(), lab[:, 1:].contiguous()
+                        ptl = F.cross_entropy(sl.reshape(-1, V), tl.reshape(-1), reduction="none").reshape(sl.shape[0], -1)
+                        loss = (ptl * tw).mean() + r["aux_loss"]
+                        if r.get("multi_token_loss") is not None: loss = loss + 0.5 * r["multi_token_loss"]
 
-                # Predictive coding: weight tokens by surprise
-                if predictive_coding and predictive_coding.enabled:
-                    with torch.no_grad():
-                        embeddings = model.embed(input_ids)
-                        next_embeddings = model.embed(labels)
-                    token_weights = predictive_coding.compute_token_weights(
-                        embeddings, next_embeddings
-                    )
-                    # Re-weight the loss per token
-                    shift_logits = result["logits"][:, :-1].contiguous()
-                    shift_labels = labels[:, 1:].contiguous()
-                    per_token_loss = F.cross_entropy(
-                        shift_logits.view(-1, model.vocab_size),
-                        shift_labels.view(-1),
-                        reduction="none",
-                    ).view(shift_logits.shape[0], -1)
-                    # Apply predictive coding weights
-                    weighted_loss = (per_token_loss * token_weights[:, 1:]).mean()
-                    # Predictor loss
-                    pred_loss = predictive_coding.compute_predictor_loss(
-                        embeddings, next_embeddings
-                    )
-                    loss = weighted_loss + result["aux_loss"] + 0.1 * pred_loss
-                    if result.get("multi_token_loss") is not None:
-                        loss = loss + 0.5 * result["multi_token_loss"]
+                (loss / accum).backward(); micro += 1
+                if micro % accum == 0:
+                    if s == "fsdp": model.clip_grad_norm_(1.0)
+                    else: torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    lr = lr_sched(step, est, 3e-3, 3e-5) * cur.get_lr_multiplier()
+                    for pg in opt.param_groups: pg["lr"] = lr
+                    opt.step(); opt.zero_grad(set_to_none=True); step += 1
 
-                # Gradient accumulation
-                loss = loss / accumulation_steps
-                loss.backward()
+                tok += ids.numel() * world
+                rl += loss.item(); rlm += r["lm_loss"].item()
 
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if step > 0 and step % 10 == 0 and main_rank(s):
+                    d = 10 * accum; al, am = rl/d, rlm/d; em = (time.time()-t0)/60
+                    parts = [f"Step {step:>5d}", f"Loss: {al:.4f}", f"PPL: {math.exp(min(am,20)):.1f}",
+                             f"Tok/s: {tok/(time.time()-t0):,.0f}", f"{tok/1e6:.0f}M tok", f"{em:.1f}m"]
+                    if rate > 0: parts.append(f"${(em/60)*rate:.2f}")
+                    log("  " + " | ".join(parts), s)
+                    if al < best: best = al
+                    rl, rlm = 0.0, 0.0
 
-                    # Update learning rate
-                    lr = get_lr(global_step, estimated_total_steps, peak_lr, min_lr)
-                    if curriculum:
-                        lr *= curriculum.get_lr_multiplier()
-                    for pg in optimizer.param_groups:
-                        pg["lr"] = lr
+                if step > 0 and step % max(1, est // 4) == 0:
+                    save(model, s, ckpt_dir, step, tok, best, dev)
+    except (StopIteration, KeyboardInterrupt): pass
 
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    global_step += 1
+    if s != "single":
+        import torch.distributed as dist
+        if dist.is_initialized(): dist.barrier()
 
-                # Track stats
-                batch_tokens = input_ids.numel()
-                total_tokens += batch_tokens
-                running_loss += loss.item() * accumulation_steps
-                running_lm_loss += result["lm_loss"].item()
+    el = time.time() - t0
+    log(f"\n{'='*70}", s)
+    log(f"DONE | {el/60:.1f}m | {step} steps | {tok/1e6:.0f}M tokens | {tok/max(1,el):,.0f} tok/s | Loss: {best:.4f}", s)
+    if rate > 0: log(f"Cost: ${(el/3600)*rate:.2f}", s)
 
-                # Logging
-                if global_step > 0 and global_step % log_interval == 0:
-                    avg_loss = running_loss / log_interval
-                    avg_lm_loss = running_lm_loss / log_interval
-                    tokens_per_sec = total_tokens / (time.time() - start_time)
-                    perplexity = math.exp(min(avg_lm_loss, 20))  # Cap to avoid overflow
+    save(model, s, ckpt_dir, step, tok, best, dev, final=True)
+    gen_test(model, s, tok_path, dev)
+    log(f"\nDownload: scp <pod>:~/Tryplicity/checkpoints/final.pt ./", s)
+    cleanup(s)
 
-                    log_parts = [
-                        f"Step {global_step:>6d}",
-                        f"Loss: {avg_loss:.4f}",
-                        f"LM: {avg_lm_loss:.4f}",
-                        f"PPL: {perplexity:.1f}",
-                        f"LR: {lr:.2e}",
-                        f"Tok/s: {tokens_per_sec:.0f}",
-                        f"Time: {elapsed_minutes:.1f}m",
-                    ]
 
-                    if curriculum:
-                        log_parts.append(f"Stage: {curriculum.get_stage_name()}")
+def save(model, s, d, step, tok, loss, dev, final=False):
+    name = "final.pt" if final else f"step{step}.pt"
+    dat = {"global_step": step, "total_tokens": tok, "best_loss": loss}
+    if s == "fsdp":
+        from torch.distributed.fsdp import (FullyShardedDataParallel as FSDP, FullStateDictConfig, StateDictType)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT,
+                                  FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
+            dat["model_state_dict"] = model.state_dict()
+            if main_rank(s): torch.save(dat, Path(d) / name)
+    elif s == "ddp":
+        if main_rank(s): dat["model_state_dict"] = model.module.state_dict(); torch.save(dat, Path(d) / name)
+    else:
+        dat["model_state_dict"] = model.state_dict(); torch.save(dat, Path(d) / name)
+    if main_rank(s): print(f"  Saved: {name} | Peak: {torch.cuda.max_memory_allocated(dev)/1e9:.1f} GB", flush=True)
 
-                    # MoE stats from last layer
-                    if result.get("stats"):
-                        last_stats = result["stats"][-1]
-                        log_parts.append(f"Experts: {last_stats.get('avg_active_experts', 0):.1f}")
 
-                    print("  " + " | ".join(log_parts))
-
-                    # Track best loss
-                    if avg_loss < best_loss:
-                        best_loss = avg_loss
-
-                    running_loss = 0.0
-                    running_lm_loss = 0.0
-
-                # Save checkpoint
-                if global_step > 0 and global_step % save_interval_steps == 0:
-                    ckpt_path = checkpoint_dir / f"checkpoint_step{global_step}.pt"
-                    torch.save({
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "global_step": global_step,
-                        "total_tokens": total_tokens,
-                        "best_loss": best_loss,
-                    }, ckpt_path)
-                    print(f"\n  Saved checkpoint: {ckpt_path}")
-
-                    # GPU memory check
-                    if device == "cuda":
-                        peak_mem = torch.cuda.max_memory_allocated() / 1e9
-                        print(f"  Peak GPU memory: {peak_mem:.2f} GB\n")
-
-    except (StopIteration, KeyboardInterrupt):
-        pass
-
-    # ---- Training complete ----
-    elapsed = time.time() - start_time
-    print(f"\n{'='*60}")
-    print("TRAINING COMPLETE")
-    print(f"{'='*60}")
-    print(f"  Total time: {elapsed/60:.1f} minutes")
-    print(f"  Total steps: {global_step}")
-    print(f"  Total tokens: {total_tokens:,}")
-    print(f"  Best loss: {best_loss:.4f}")
-    print(f"  Final perplexity: {math.exp(min(best_loss, 20)):.1f}")
-
-    if device == "cuda":
-        peak_mem = torch.cuda.max_memory_allocated() / 1e9
-        print(f"  Peak GPU memory: {peak_mem:.2f} GB")
-
-    # Save final checkpoint
-    final_path = checkpoint_dir / f"final_{mode}.pt"
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "global_step": global_step,
-        "total_tokens": total_tokens,
-        "best_loss": best_loss,
-        "mode": mode,
-        "elapsed_seconds": elapsed,
-    }, final_path)
-    print(f"  Final model saved: {final_path}")
-
-    # ---- Test generation ----
-    print(f"\n{'='*60}")
-    print("GENERATION TEST")
-    print(f"{'='*60}")
-
-    tokenizer = Tokenizer.from_file(tokenizer_path)
-
-    test_prompts = [
-        "The meaning of life is",
-        "Once upon a time",
-        "In mathematics, we can",
-        "def fibonacci(n):",
-        "The capital of France is",
-    ]
-
-    model.eval()
-    for prompt in test_prompts:
-        encoded = tokenizer.encode(prompt)
-        input_ids = torch.tensor([encoded.ids], device=device)
-
+def gen_test(model, s, tp, dev):
+    if not main_rank(s): return
+    log(f"\nGENERATION TEST", s)
+    t = Tokenizer.from_file(tp)
+    prompts = ["The meaning of life is", "Once upon a time", "def fibonacci(n):"]
+    def g(m, i):
+        x = i
         with torch.no_grad():
-            generated = model.generate(input_ids, max_new_tokens=50, temperature=0.8)
-
-        output_text = tokenizer.decode(generated[0].tolist())
-        print(f"\n  Prompt: {prompt}")
-        print(f"  Output: {output_text[:200]}")
-
-    print(f"\n{'='*60}")
-    print("DONE")
-    print(f"{'='*60}")
-
-    return model
+            for _ in range(60):
+                r = m(x[:, -4096:]); p = F.softmax(r["logits"][:, -1, :] / 0.8, dim=-1)
+                x = torch.cat([x, torch.multinomial(p, 1)], dim=-1)
+        return x
+    if s == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        with FSDP.summon_full_params(model, writeback=False):
+            model.eval()
+            for p in prompts:
+                i = torch.tensor([t.encode(p).ids], device=dev)
+                log(f"  > {p}\n    {t.decode(g(model, i)[0].tolist())[:200]}", s)
+    else:
+        raw = model.module if s == "ddp" else model; raw.eval()
+        for p in prompts:
+            i = torch.tensor([t.encode(p).ids], device=dev)
+            log(f"  > {p}\n    {t.decode(g(raw, i)[0].tolist())[:200]}", s)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Tryplicity")
-    parser.add_argument("--mode", type=str, default="test", choices=["test", "full"],
-                        help="Training mode: 'test' (10 min) or 'full' (12 hours)")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to train on")
-    parser.add_argument("--data-dir", type=str, default="./data")
-    parser.add_argument("--tokenizer", type=str, default="./tokenizer/tryplicity.json")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
-    args = parser.parse_args()
-
-    train(
-        mode=args.mode,
-        device=args.device,
-        data_dir=args.data_dir,
-        tokenizer_path=args.tokenizer,
-        checkpoint_dir=args.checkpoint_dir,
-    )
+    pa = argparse.ArgumentParser()
+    pa.add_argument("--minutes", type=float, default=11.0)
+    pa.add_argument("--rate", type=float, default=0.0)
+    pa.add_argument("--data-dir", type=str, default="./data/filtered")
+    pa.add_argument("--tokenizer", type=str, default="./tokenizer/tryplicity.json")
+    pa.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
+    a = pa.parse_args()
+    train(a.minutes, a.rate, a.data_dir, a.tokenizer, a.checkpoint_dir)
