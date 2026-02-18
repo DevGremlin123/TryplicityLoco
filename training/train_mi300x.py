@@ -95,7 +95,7 @@ def train_mi300x(
     - DDP across 8 GPUs
     - No gradient checkpointing (1.5 TB VRAM)
     - No GaLore (full optimizer states fit)
-    - Massive batch sizes (32/GPU × 8 = 256 seqs)
+    - Batch sizes: 8/GPU × 8 GPUs × 16 accum = 1024 seqs effective
     - Streaming dataloader (2B tokens too big for RAM)
     - Compressed curriculum (36 min instead of 10 hrs)
     - Higher peak LR (6e-3) for faster convergence
@@ -123,9 +123,9 @@ def train_mi300x(
     print_main("=" * 70)
 
     # ---- Training hyperparams ----
-    batch_size_per_gpu = 32     # 32 seqs × 4096 tokens = 131K tokens/GPU
+    batch_size_per_gpu = 8      # 8 seqs × 4096 tokens = 33K tokens/GPU (fits in 192GB)
     max_seq_len = 4096
-    accumulation_steps = 4      # Effective batch: 32 × 8 × 4 = 1024 seqs = 4.2M tokens
+    accumulation_steps = 16     # Effective batch: 8 × 8 × 16 = 1024 seqs = 4.2M tokens
     peak_lr = config.training.peak_lr
     min_lr = config.training.min_lr
 
@@ -319,6 +319,10 @@ def train_mi300x(
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)  # More memory efficient
                     global_step += 1
+
+                    # Free fragmented GPU memory periodically
+                    if global_step % 50 == 0:
+                        torch.cuda.empty_cache()
 
                 # Track stats
                 batch_tokens = input_ids.numel()
