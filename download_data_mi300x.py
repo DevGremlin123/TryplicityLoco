@@ -190,6 +190,7 @@ DATASETS = [
         "name": "cosmopedia",
         "dataset_id": "HuggingFaceTB/cosmopedia",
         "num_samples": 500_000,
+        "subset": "web_samples_v2",
         "description": "Cosmopedia (synthetic textbooks — zero web slop)",
         "est_gb": 5,
         "share": "12.5%",
