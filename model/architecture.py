@@ -473,8 +473,41 @@ def create_tiny_model() -> TryplicityModel:
     )
 
 
+def create_5090_model() -> TryplicityModel:
+    """Create a medium model (~1B total params) that fits in 32 GB VRAM for RTX 5090.
+    Same architecture as full model (Mamba+GQA+MoE+BitNet+Spike+HyperConn)
+    but halved dimensions. Model ~2 GB bf16, gradients ~2 GB, optimizer ~4 GB = ~8 GB.
+    Leaves ~24 GB headroom for activations. Trains the full pipeline correctly."""
+    return TryplicityModel(
+        vocab_size=32000,
+        hidden_size=1024,
+        num_layers=24,
+        max_seq_len=2048,
+        mamba_state_dim=64,
+        mamba_conv_dim=4,
+        mamba_expand_factor=2,
+        num_attention_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        num_experts=32,
+        num_shared_experts=2,
+        expert_hidden_size=384,
+        base_active_experts=6,
+        min_active_experts=4,
+        max_active_experts=10,
+        use_bitnet=True,
+        use_spike=True,
+        use_dynamic_sparsity=True,
+        use_lateral_inhibition=True,
+        use_hyper_connections=True,
+        hyper_num_streams=4,
+        num_predict_tokens=2,
+        gradient_checkpointing=True,
+    )
+
+
 def create_full_model() -> TryplicityModel:
-    """Create the full 3B parameter model for 12-hour training."""
+    """Create the full 9.4B parameter model (3B active) for cloud GPU training."""
     return TryplicityModel(
         vocab_size=32000,
         hidden_size=2048,

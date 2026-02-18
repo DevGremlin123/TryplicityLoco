@@ -24,7 +24,7 @@ from datetime import datetime
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from model.architecture import TryplicityModel, create_full_model
+from model.architecture import TryplicityModel, create_5090_model
 from training.data_pipeline import StreamingTextDataset
 from training.config import get_mi300x_config, FullConfig, ModelConfig, BrainConfig, TrainingConfig, CurriculumStageConfig
 from brain.curriculum import NeuroCurriculum
@@ -228,8 +228,8 @@ def train_5090(
     print(f"  Model dtype: bfloat16 (saves ~6 GB)")
 
     # ---- Create model in bf16 ----
-    print("\nCreating 3B model (bf16)...")
-    model = create_full_model()
+    print("\nCreating 5090 model (bf16, fits in 32 GB)...")
+    model = create_5090_model()
     model = model.to(device=device, dtype=torch.bfloat16)
 
     params = model.count_parameters()
@@ -268,11 +268,11 @@ def train_5090(
 
     # ---- Brain modules ----
     print("\nInitializing brain modules...")
-    hidden_size = 2048
+    hidden_size = 1024
 
     hebbian = HebbianAuxLoss(
         hidden_size=hidden_size,
-        num_layers=32,
+        num_layers=24,
         enabled=True,
     ).to(device=device, dtype=torch.bfloat16)
 
