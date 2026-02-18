@@ -262,17 +262,17 @@ def load_models(num_gpus=4):
     except Exception as e:
         print(f"SKIP ({e})")
 
-    # Judge 4: Llama-3.2-1B-Instruct (GPU 3)
-    print("\n  [4/5] Llama-3.2-1B-Instruct")
-    print("        Meta's compact model — web-scale training perspective")
+    # Judge 4: TinyLlama-1.1B-Chat (GPU 3) — NOT gated, no HF token needed
+    print("\n  [4/5] TinyLlama-1.1B-Chat")
+    print("        Open-source 1.1B model — diverse training perspective")
     device3 = f"cuda:{min(3, num_gpus-1)}" if num_gpus > 0 else "cpu"
     print(f"        Loading to {device3}...", end=" ", flush=True)
     try:
-        tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+        tok = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
         mdl = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.2-1B-Instruct", torch_dtype=torch.bfloat16
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0", torch_dtype=torch.bfloat16
         ).to(device3).eval()
-        judges.append(("Llama", lambda t, _m=mdl, _t=tok, _d=device3: score_with_llm(_m, _t, t, _d), 3))
+        judges.append(("TinyLlama", lambda t, _m=mdl, _t=tok, _d=device3: score_with_llm(_m, _t, t, _d), 3))
         print("LOADED")
     except Exception as e:
         print(f"SKIP ({e})")

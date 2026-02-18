@@ -461,10 +461,16 @@ def train_h200(
 
             for prompt in prompts:
                 encoded = tokenizer.encode(prompt)
-                ids = torch.tensor([encoded.ids], device=device)
+                generated = torch.tensor([encoded.ids], device=device)
                 with torch.no_grad():
-                    gen = model.module.generate(ids, max_new_tokens=80, temperature=0.8)
-                text = tokenizer.decode(gen[0].tolist())
+                    for _ in range(80):
+                        context = generated[:, -4096:]
+                        result = model(context)
+                        logits = result["logits"][:, -1, :] / 0.8
+                        probs = F.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                        generated = torch.cat([generated, next_token], dim=-1)
+                text = tokenizer.decode(generated[0].tolist())
                 log(f"\n  > {prompt}")
                 log(f"    {text[:250]}")
 
