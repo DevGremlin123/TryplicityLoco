@@ -60,8 +60,8 @@ class BitLinear(nn.Module):
         w_quant = weight_quant_158(self.weight)
         # Quantize activations to int8
         x_quant = activation_quant(x)
-        # Standard matmul (hardware will accelerate ternary ops)
-        out = F.linear(x_quant, w_quant, self.bias)
+        # Ensure matching dtypes (rounding ops can promote bf16 to float32)
+        out = F.linear(x_quant.to(w_quant.dtype), w_quant, self.bias)
         return out
 
 
