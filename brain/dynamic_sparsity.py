@@ -82,8 +82,9 @@ class DynamicSparsityRouter(nn.Module):
         if not self.enabled:
             # Fixed top-k routing (baseline)
             topk_vals, topk_idx = gate_logits.topk(self.base_k, dim=-1)
-            routing_weights = torch.zeros_like(gate_logits)
-            routing_weights.scatter_(-1, topk_idx, F.softmax(topk_vals, dim=-1))
+            topk_weights = F.softmax(topk_vals, dim=-1)
+            routing_weights = torch.zeros_like(topk_weights).expand_as(gate_logits).clone()
+            routing_weights.scatter_(-1, topk_idx, topk_weights)
             return routing_weights, torch.tensor(0.0, device=hidden_states.device), {"avg_k": self.base_k}
 
         # Step 2: Compute per-token difficulty
@@ -131,7 +132,7 @@ class DynamicSparsityRouter(nn.Module):
         # Update EMA stats
         if self.training:
             with torch.no_grad():
-                self.avg_k_ema.lerp_(avg_k.detach(), 0.01)
+                self.avg_k_ema.lerp_(avg_k.detach().float(), 0.01)
 
         stats = {
             "avg_active_experts": avg_k.item(),
@@ -191,8 +192,9 @@ class LateralInhibitionRouter(DynamicSparsityRouter):
 
         if not self.enabled:
             topk_vals, topk_idx = gate_logits.topk(self.base_k, dim=-1)
-            routing_weights = torch.zeros_like(gate_logits)
-            routing_weights.scatter_(-1, topk_idx, F.softmax(topk_vals, dim=-1))
+            topk_weights = F.softmax(topk_vals, dim=-1)
+            routing_weights = torch.zeros_like(topk_weights).expand_as(gate_logits).clone()
+            routing_weights.scatter_(-1, topk_idx, topk_weights)
             return routing_weights, torch.tensor(0.0, device=hidden_states.device), {"avg_k": self.base_k}
 
         # Difficulty-based dynamic k
@@ -240,7 +242,7 @@ class LateralInhibitionRouter(DynamicSparsityRouter):
         if self.training:
             with torch.no_grad():
                 self.steps_since_update += 1
-                self.avg_k_ema.lerp_(avg_k.detach(), 0.01)
+                self.avg_k_ema.lerp_(avg_k.detach().float(), 0.01)
 
         stats = {
             "avg_active_experts": avg_k.item(),

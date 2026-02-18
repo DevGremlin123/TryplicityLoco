@@ -87,7 +87,7 @@ class HebbianAuxLoss(nn.Module):
         # Correlation: [B, H, H] (batch-averaged)
         corr = torch.bmm(normalized.transpose(1, 2), normalized) / sample_size
         # Loss: deviation from identity (off-diagonal elements should be 0)
-        identity = torch.eye(self.hidden_size, device=corr.device).unsqueeze(0)
+        identity = torch.eye(self.hidden_size, device=corr.device, dtype=corr.dtype).unsqueeze(0)
         decorr_loss = (corr - identity).pow(2).mean()
 
         # 2. SPARSITY LOSS (L1 penalty on activations)
